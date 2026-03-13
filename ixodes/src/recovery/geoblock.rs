@@ -61,21 +61,21 @@ fn is_blocked(code: &str, blocked: &HashSet<String>) -> bool {
 
 #[cfg(target_os = "windows")]
 fn get_system_country() -> Result<Option<String>, String> {
-    use windows::Win32::Globalization::{GEO_ISO2, GEOCLASS_NATION, GetGeoInfoW, GetUserGeoID};
+    use windows_sys::Win32::Globalization::{GEO_ISO2, GEOCLASS_NATION, GetGeoInfoW, GetUserGeoID};
 
     unsafe {
-        let geo_id = GetUserGeoID(GEOCLASS_NATION);
+        let geo_id = GetUserGeoID(GEOCLASS_NATION as _);
         if geo_id == 0 {
             return Ok(None);
         }
 
-        let len = GetGeoInfoW(geo_id, GEO_ISO2, None, 0);
+        let len = GetGeoInfoW(geo_id, GEO_ISO2 as _, std::ptr::null_mut(), 0, 0);
         if len == 0 {
             return Ok(None);
         }
 
         let mut buffer = vec![0u16; len as usize];
-        let result = GetGeoInfoW(geo_id, GEO_ISO2, Some(&mut buffer), 0);
+        let result = GetGeoInfoW(geo_id, GEO_ISO2 as _, buffer.as_mut_ptr(), len, 0);
 
         if result == 0 {
             return Err("GetGeoInfoW failed".to_string());

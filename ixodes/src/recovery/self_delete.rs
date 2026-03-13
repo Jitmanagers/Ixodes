@@ -2,13 +2,12 @@ use crate::recovery::settings::RecoveryControl;
 use std::ffi::c_void;
 use std::mem::size_of;
 use tracing::{debug, error, info};
-use windows::Win32::Foundation::{CloseHandle, HANDLE};
-use windows::Win32::Storage::FileSystem::{
+use windows_sys::Win32::Foundation::CloseHandle;
+use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_DISPOSITION_INFO, FILE_RENAME_INFO,
     FILE_SHARE_DELETE, FILE_SHARE_READ, FileDispositionInfo, FileRenameInfo, OPEN_EXISTING,
     SetFileInformationByHandle,
 };
-use windows::core::PCWSTR;
 
 #[cfg(feature = "persistence")]
 fn check_persistence() -> bool {
@@ -52,18 +51,17 @@ pub unsafe fn perform_silent_delete() -> Result<(), String> {
 
     let handle = unsafe {
         CreateFileW(
-            PCWSTR(path_w.as_ptr()),
-            DELETE.0,
+            path_w.as_ptr(),
+            DELETE,
             FILE_SHARE_READ | FILE_SHARE_DELETE,
-            None,
+            std::ptr::null_mut(),
             OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL,
-            HANDLE::default(),
+            std::ptr::null_mut(),
         )
-    }
-    .map_err(|e| format!("failed to open file for deletion: {}", e))?;
+    };
 
-    if handle.is_invalid() {
+    if handle as isize == -1 {
         return Err("invalid file handle".to_string());
     }
 
@@ -72,8 +70,8 @@ pub unsafe fn perform_silent_delete() -> Result<(), String> {
     let mut buffer = vec![0u8; rename_info_size];
     let rename_info = unsafe { &mut *(buffer.as_mut_ptr() as *mut FILE_RENAME_INFO) };
 
-    rename_info.Anonymous.ReplaceIfExists = true.into();
-    rename_info.RootDirectory = HANDLE::default();
+    rename_info.Anonymous.ReplaceIfExists = 1; // TRUE
+    rename_info.RootDirectory = std::ptr::null_mut();
     rename_info.FileNameLength = ((stream_name.len() - 1) * 2) as u32;
 
     unsafe {
@@ -91,26 +89,24 @@ pub unsafe fn perform_silent_delete() -> Result<(), String> {
             buffer.as_ptr() as *const c_void,
             rename_info_size as u32,
         )
-    }
-    .is_err()
+    } == 0
     {
         let _ = unsafe { CloseHandle(handle) };
         return Err("failed to rename to ADS".to_string());
     }
 
-    let delete_info = FILE_DISPOSITION_INFO {
-        DeleteFile: true.into(),
+    let mut delete_info = FILE_DISPOSITION_INFO {
+        DeleteFile: 1, // TRUE
     };
 
     if unsafe {
         SetFileInformationByHandle(
             handle,
             FileDispositionInfo,
-            &delete_info as *const _ as *const c_void,
+            &mut delete_info as *mut _ as *const c_void,
             size_of::<FILE_DISPOSITION_INFO>() as u32,
         )
-    }
-    .is_err()
+    } == 0
     {
         let _ = unsafe { CloseHandle(handle) };
         return Err("failed to set delete disposition".to_string());

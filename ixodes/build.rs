@@ -24,18 +24,19 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut obfuscation_key = [0u8; 32];
     rng.fill_bytes(&mut obfuscation_key);
 
+    let litcrypt_key = hex::encode(obfuscation_key);
+    println!("cargo:rustc-env=LITCRYPT_ENCRYPT_KEY={}", litcrypt_key);
+
     const VARIANTS: [&str; 4] = ["alpha", "beta", "gamma", "delta"];
     let variant = VARIANTS[(rng.next_u32() as usize) % VARIANTS.len()];
     println!("cargo:rustc-cfg=build_variant={variant:?}");
 
-    // Handle embedded payload if provided
     if let Ok(payload_path) = env::var("IXODES_PAYLOAD_PATH") {
         let path = Path::new(&payload_path);
         if path.exists() {
             let payload_bytes = fs::read(path)?;
             let mut encrypted = payload_bytes;
 
-            // Use the same encryption logic as in helpers/payload.rs
             for i in 0..encrypted.len() {
                 let key_byte = obfuscation_key[i % obfuscation_key.len()];
                 encrypted[i] = encrypted[i].wrapping_add((i.wrapping_mul(13)) as u8);
@@ -102,6 +103,20 @@ fn main() -> Result<(), Box<dyn Error>> {
         "#[allow(dead_code)]\npub const OBFUSCATION_KEY: [u8; 32] = [{}];",
         hex_list(&obfuscation_key)
     )?;
+
+    let resource_name = env::var("IXODES_RESOURCE_NAME").unwrap_or_else(|_| "IXODE_CFG".to_string());
+    if let Some(id_str) = resource_name.strip_prefix('#') {
+        if let Ok(id) = id_str.parse::<u16>() {
+            writeln!(file, "pub const RESOURCE_ID: Option<u16> = Some({id});")?;
+            writeln!(file, "pub const RESOURCE_NAME: Option<&'static str> = None;")?;
+        } else {
+            writeln!(file, "pub const RESOURCE_ID: Option<u16> = None;")?;
+            writeln!(file, "pub const RESOURCE_NAME: Option<&'static str> = Some(\"{resource_name}\");")?;
+        }
+    } else {
+        writeln!(file, "pub const RESOURCE_ID: Option<u16> = None;")?;
+        writeln!(file, "pub const RESOURCE_NAME: Option<&'static str> = Some(\"{resource_name}\");")?;
+    }
 
     Ok(())
 }

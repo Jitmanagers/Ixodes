@@ -102,7 +102,7 @@ impl RecoveryTask for VncTask {
         )
         .await?;
 
-        Ok(vec![artifact])
+        Ok(artifact.into_iter().collect())
     }
 }
 

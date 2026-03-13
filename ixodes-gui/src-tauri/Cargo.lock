@@ -1838,6 +1838,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "thiserror 2.0.18",
  "windows 0.52.0",
 ]
 

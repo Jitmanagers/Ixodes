@@ -61,7 +61,7 @@
             onValueChange={(val) => onPumpUnitChange(val as "kb" | "mb" | "gb")}
         >
           <SelectTrigger>
-            <span>Unit</span>
+            <span class="uppercase">{pumpUnit}</span>
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="kb">KB</SelectItem>

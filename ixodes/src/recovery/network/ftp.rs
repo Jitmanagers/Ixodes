@@ -138,7 +138,6 @@ impl RecoveryTask for WinSCPTask {
 async fn ftp_output_dir(ctx: &RecoveryContext, label: &str) -> Result<PathBuf, RecoveryError> {
     let folder = ctx
         .output_dir
-        .join("services")
         .join("System")
         .join("FTP")
         .join(sanitize_label(label));

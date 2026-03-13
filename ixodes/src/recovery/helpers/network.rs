@@ -1,16 +1,39 @@
 use crate::recovery::task::RecoveryError;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::process::Command;
 
+#[derive(Serialize, Deserialize)]
 pub struct NetworkTrafficStat {
     pub name: String,
-    pub received_bytes: Option<u64>,
-    pub transmitted_bytes: Option<u64>,
+    pub description: String,
+    pub status: String,
+    pub mac_address: String,
+    pub link_speed: String,
+    pub received_bytes: u64,
+    pub sent_bytes: u64,
+    pub received_packets: u64,
+    pub sent_packets: u64,
 }
 
 pub async fn gather_network_traffic() -> Result<Vec<NetworkTrafficStat>, RecoveryError> {
-    let script = r#"Get-NetAdapterStatistics | Select-Object Name,ReceivedBytes,SentBytes | ConvertTo-Json -Depth 1"#;
+    let script = r#"
+        Get-NetAdapter | ForEach-Object {
+            $stat = Get-NetAdapterStatistics -Name $_.Name
+            [PSCustomObject]@{
+                Name = $_.Name
+                Description = $_.InterfaceDescription
+                Status = $_.Status.ToString()
+                MacAddress = $_.MacAddress
+                LinkSpeed = $_.LinkSpeed
+                ReceivedBytes = $stat.ReceivedBytes
+                SentBytes = $stat.SentBytes
+                ReceivedPackets = $stat.ReceivedPackets
+                SentPackets = $stat.SentPackets
+            }
+        } | ConvertTo-Json
+    "#;
+    
     let value = capture_powershell_json(script).await?;
     Ok(parse_network_stats(value))
 }
@@ -44,35 +67,17 @@ fn parse_network_stats(value: Value) -> Vec<NetworkTrafficStat> {
     match value {
         Value::Array(items) => {
             for item in items {
-                if let Ok(raw) = serde_json::from_value::<RawNetAdapterStat>(item) {
-                    adapters.push(raw.into());
+                if let Ok(stat) = serde_json::from_value::<NetworkTrafficStat>(item) {
+                    adapters.push(stat);
                 }
             }
         }
         Value::Object(_) => {
-            if let Ok(raw) = serde_json::from_value::<RawNetAdapterStat>(value) {
-                adapters.push(raw.into());
+            if let Ok(stat) = serde_json::from_value::<NetworkTrafficStat>(value) {
+                adapters.push(stat);
             }
         }
         _ => {}
     }
     adapters
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct RawNetAdapterStat {
-    name: String,
-    received_bytes: Option<u64>,
-    sent_bytes: Option<u64>,
-}
-
-impl From<RawNetAdapterStat> for NetworkTrafficStat {
-    fn from(raw: RawNetAdapterStat) -> Self {
-        Self {
-            name: raw.name,
-            received_bytes: raw.received_bytes,
-            transmitted_bytes: raw.sent_bytes,
-        }
-    }
 }

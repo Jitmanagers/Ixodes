@@ -27,9 +27,9 @@ pub fn decrypt_payload(bytes: &[u8]) -> Vec<u8> {
         .enumerate()
         .map(|(i, &b)| {
             let key_byte = OBFUSCATION_KEY[i % OBFUSCATION_KEY.len()];
-            (b ^ key_byte)
-                .rotate_right((i % 8) as u32)
-                .wrapping_sub((i.wrapping_mul(13)) as u8)
+            let mut val = b ^ key_byte;
+            val = val.rotate_right((i % 8) as u32);
+            val.wrapping_sub((i.wrapping_mul(13)) as u8)
         })
         .collect()
 }

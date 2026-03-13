@@ -158,32 +158,30 @@ pub async fn run_clipper() {
 fn get_clipboard_text() -> Option<String> {
     #[cfg(windows)]
     {
-        use windows::Win32::Foundation::{HGLOBAL, HWND};
-        use windows::Win32::System::DataExchange::{
+        use windows_sys::Win32::System::DataExchange::{
             CloseClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard,
         };
-        use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
-        use windows::Win32::System::Ole::CF_UNICODETEXT;
+        use windows_sys::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+
+        const CF_UNICODETEXT: u32 = 13;
 
         unsafe {
-            if OpenClipboard(HWND(0)).is_err() {
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
                 return None;
             }
 
             let mut result = None;
-            if IsClipboardFormatAvailable(CF_UNICODETEXT.0 as u32).is_ok() {
-                if let Ok(handle) = GetClipboardData(CF_UNICODETEXT.0 as u32) {
-                    if handle.0 != 0 {
-                        let hglobal = HGLOBAL(handle.0 as *mut _);
-                        let ptr = GlobalLock(hglobal);
-                        if !ptr.is_null() {
-                            let size = GlobalSize(hglobal);
-                            let len = (size / 2).saturating_sub(1);
-                            let slice = std::slice::from_raw_parts(ptr as *const u16, len as usize);
-                            let text = String::from_utf16_lossy(slice);
-                            let _ = GlobalUnlock(hglobal);
-                            result = Some(text.trim_end_matches('\u{0}').to_string());
-                        }
+            if IsClipboardFormatAvailable(CF_UNICODETEXT) != 0 {
+                let handle = GetClipboardData(CF_UNICODETEXT);
+                if !handle.is_null() {
+                    let ptr = GlobalLock(handle);
+                    if !ptr.is_null() {
+                        let size = GlobalSize(handle);
+                        let len = (size / 2).saturating_sub(1);
+                        let slice = std::slice::from_raw_parts(ptr as *const u16, len as usize);
+                        let text = String::from_utf16_lossy(slice);
+                        let _ = GlobalUnlock(handle);
+                        result = Some(text.trim_end_matches('\u{0}').to_string());
                     }
                 }
             }
@@ -200,32 +198,31 @@ fn get_clipboard_text() -> Option<String> {
 fn set_clipboard_text(text: &str) -> bool {
     #[cfg(windows)]
     {
-        use windows::Win32::Foundation::HWND;
-        use windows::Win32::System::DataExchange::{
+        use windows_sys::Win32::System::DataExchange::{
             CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
         };
-        use windows::Win32::System::Memory::{GHND, GlobalAlloc, GlobalLock, GlobalUnlock};
-        use windows::Win32::System::Ole::CF_UNICODETEXT;
+        use windows_sys::Win32::System::Memory::{GHND, GlobalAlloc, GlobalLock, GlobalUnlock};
+
+        const CF_UNICODETEXT: u32 = 13;
 
         unsafe {
-            if OpenClipboard(HWND(0)).is_err() {
+            if OpenClipboard(std::ptr::null_mut()) == 0 {
                 return false;
             }
 
             let mut success = false;
-            if EmptyClipboard().is_ok() {
+            if EmptyClipboard() != 0 {
                 let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
                 let size = utf16.len() * 2;
 
-                if let Ok(hglobal) = GlobalAlloc(GHND, size) {
+                let hglobal = GlobalAlloc(GHND, size as usize);
+                if !hglobal.is_null() {
                     let ptr = GlobalLock(hglobal);
                     if !ptr.is_null() {
                         std::ptr::copy_nonoverlapping(utf16.as_ptr(), ptr as *mut u16, utf16.len());
                         let _ = GlobalUnlock(hglobal);
 
-                        if SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(hglobal.0 as isize))
-                            .is_ok()
-                        {
+                        if !SetClipboardData(CF_UNICODETEXT, hglobal).is_null() {
                             success = true;
                         }
                     }
@@ -241,6 +238,3 @@ fn set_clipboard_text(text: &str) -> bool {
         false
     }
 }
-
-#[cfg(windows)]
-use windows::Win32::Foundation::HANDLE;

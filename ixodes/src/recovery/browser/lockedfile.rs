@@ -10,20 +10,19 @@ use std::fs::File;
 use std::io::Write;
 use std::mem::{size_of, zeroed};
 use std::path::Path;
-use windows::Win32::Foundation::{
-    CloseHandle, HANDLE, INVALID_HANDLE_VALUE, MAX_PATH, STATUS_INFO_LENGTH_MISMATCH,
+use windows_sys::Win32::Foundation::{
+    CloseHandle, INVALID_HANDLE_VALUE, MAX_PATH, STATUS_INFO_LENGTH_MISMATCH,
     STATUS_SUCCESS,
 };
-use windows::Win32::Storage::FileSystem::{GetLogicalDriveStringsW, QueryDosDeviceW};
-use windows::Win32::System::Diagnostics::ToolHelp::{
+use windows_sys::Win32::Storage::FileSystem::{GetLogicalDriveStringsW, QueryDosDeviceW};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
-use windows::Win32::System::Memory::{PAGE_READONLY, SECTION_MAP_READ};
-use windows::Win32::System::ProcessStatus::GetMappedFileNameW;
-use windows::Win32::System::Threading::{
+use windows_sys::Win32::System::Memory::{PAGE_READONLY, SECTION_MAP_READ};
+use windows_sys::Win32::System::ProcessStatus::GetMappedFileNameW;
+use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, OpenProcess, PROCESS_DUP_HANDLE, PROCESS_QUERY_LIMITED_INFORMATION,
 };
-use windows::core::PCWSTR;
 
 fn u16_ptr_to_string(ptr: *const u16) -> String {
     if ptr.is_null() {
@@ -49,8 +48,7 @@ pub mod proc {
 
     pub fn find_by_name(name: &str) -> u32 {
         unsafe {
-            let h_snap =
-                CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0).unwrap_or(INVALID_HANDLE_VALUE);
+            let h_snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if h_snap == INVALID_HANDLE_VALUE {
                 return 0;
             }
@@ -58,7 +56,7 @@ pub mod proc {
             let mut pe: PROCESSENTRY32W = zeroed();
             pe.dwSize = size_of::<PROCESSENTRY32W>() as u32;
 
-            if Process32FirstW(h_snap, &mut pe).is_ok() {
+            if Process32FirstW(h_snap, &mut pe) != 0 {
                 loop {
                     let exe_file = u16_arr_to_string(&pe.szExeFile);
                     if exe_file.eq_ignore_ascii_case(name) {
@@ -66,7 +64,7 @@ pub mod proc {
                         return pe.th32ProcessID;
                     }
 
-                    if Process32NextW(h_snap, &mut pe).is_err() {
+                    if Process32NextW(h_snap, &mut pe) == 0 {
                         break;
                     }
                 }
@@ -80,20 +78,20 @@ pub mod proc {
 mod obj {
     use super::*;
 
-    pub fn get_type(handle: HANDLE) -> String {
+    pub fn get_type(handle: *mut c_void) -> String {
         unsafe {
             let mut len: u32 = 4096;
             let mut buf: Vec<u8> = vec![0; len as usize];
 
             let status = NtQueryObject(
-                handle.0 as _,
+                handle,
                 ObjectTypeInformation,
                 buf.as_mut_ptr() as _,
                 len,
                 &mut len,
             );
 
-            if status != STATUS_SUCCESS.0 {
+            if status != STATUS_SUCCESS as i32 {
                 return String::new();
             }
 
@@ -114,32 +112,32 @@ mod obj {
 mod section {
     use super::*;
 
-    pub fn get_file_name(section_handle: HANDLE) -> String {
+    pub fn get_file_name(section_handle: *mut c_void) -> String {
         unsafe {
             let mut base: *mut c_void = null_mut();
             let mut view_size: usize = 0;
 
             let status = NtMapViewOfSection(
-                section_handle.0 as _,
-                GetCurrentProcess().0 as _,
-                &mut base,
+                section_handle as *mut _,
+                GetCurrentProcess() as *mut _,
+                &mut base as *mut _ as _,
                 0,
                 0,
                 null_mut(),
                 &mut view_size,
                 ViewShare,
                 0,
-                PAGE_READONLY.0,
+                PAGE_READONLY as _,
             );
 
-            if status != STATUS_SUCCESS.0 {
+            if status != STATUS_SUCCESS as i32 {
                 return String::new();
             }
 
             let mut device_path_buf = [0u16; (MAX_PATH * 2) as usize];
-            let result = GetMappedFileNameW(GetCurrentProcess(), base as _, &mut device_path_buf);
+            let result = GetMappedFileNameW(GetCurrentProcess() as _, base as _, device_path_buf.as_mut_ptr(), device_path_buf.len() as u32);
 
-            NtUnmapViewOfSection(GetCurrentProcess().0 as _, base);
+            NtUnmapViewOfSection(GetCurrentProcess() as *mut _, base as *mut _);
 
             if result == 0 {
                 return String::new();
@@ -153,7 +151,8 @@ mod section {
     fn resolve_dos_path(device_path: String) -> String {
         unsafe {
             let mut drives_buf = [0u16; 512];
-            if GetLogicalDriveStringsW(Some(&mut drives_buf)) > 0 {
+            let len = GetLogicalDriveStringsW(drives_buf.len() as u32, drives_buf.as_mut_ptr());
+            if len > 0 {
                 let mut ptr = drives_buf.as_ptr();
                 while *ptr != 0 {
                     let drive_root = u16_ptr_to_string(ptr);
@@ -163,7 +162,7 @@ mod section {
                     let drive_letter_u16: Vec<u16> =
                         drive_letter.encode_utf16().chain(Some(0)).collect();
 
-                    if QueryDosDeviceW(PCWSTR(drive_letter_u16.as_ptr()), Some(&mut dev_name_buf))
+                    if QueryDosDeviceW(drive_letter_u16.as_ptr(), dev_name_buf.as_mut_ptr(), dev_name_buf.len() as u32)
                         > 0
                     {
                         let dev_name = u16_arr_to_string(&dev_name_buf);
@@ -213,12 +212,11 @@ pub fn copy_locked_file(proc_name: &str, target_file: &Path, dest_path: &Path) -
     unsafe {
         let h_proc = OpenProcess(
             PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION,
-            false,
+            0,
             pid,
-        )
-        .unwrap_or(INVALID_HANDLE_VALUE);
+        );
 
-        if h_proc == INVALID_HANDLE_VALUE {
+        if h_proc.is_null() || h_proc == INVALID_HANDLE_VALUE as _ {
             return false;
         }
 
@@ -233,7 +231,7 @@ pub fn copy_locked_file(proc_name: &str, target_file: &Path, dest_path: &Path) -
             &mut return_len,
         );
 
-        if status == STATUS_INFO_LENGTH_MISMATCH.0 {
+        if status == STATUS_INFO_LENGTH_MISMATCH as i32 {
             buf_size = return_len + 1024;
             buffer.resize(buf_size as usize, 0);
             status = NtQuerySystemInformation(
@@ -244,7 +242,7 @@ pub fn copy_locked_file(proc_name: &str, target_file: &Path, dest_path: &Path) -
             );
         }
 
-        if status != STATUS_SUCCESS.0 {
+        if status != STATUS_SUCCESS as i32 {
             let _ = CloseHandle(h_proc);
             return false;
         }
@@ -261,29 +259,28 @@ pub fn copy_locked_file(proc_name: &str, target_file: &Path, dest_path: &Path) -
 
             let mut h_dup: *mut c_void = null_mut();
             let dup_status = NtDuplicateObject(
-                h_proc.0 as _,
-                handle_entry.HandleValue as _,
-                GetCurrentProcess().0 as _,
-                &mut h_dup,
-                SECTION_MAP_READ.0,
+                h_proc as *mut _,
+                handle_entry.HandleValue as *mut _,
+                GetCurrentProcess() as *mut _,
+                &mut h_dup as *mut _ as _,
+                SECTION_MAP_READ as u32,
                 0,
                 0,
             );
 
-            if dup_status != STATUS_SUCCESS.0 {
+            if dup_status != STATUS_SUCCESS as i32 {
                 continue;
             }
 
-            let h_dup_win = HANDLE(h_dup as isize);
-            let type_name = obj::get_type(h_dup_win);
+            let type_name = obj::get_type(h_dup);
             if type_name != "Section" {
-                let _ = CloseHandle(h_dup_win);
+                let _ = CloseHandle(h_dup as _);
                 continue;
             }
 
-            let full_path = section::get_file_name(h_dup_win);
+            let full_path = section::get_file_name(h_dup);
             if full_path.is_empty() {
-                let _ = CloseHandle(h_dup_win);
+                let _ = CloseHandle(h_dup as _);
                 continue;
             }
 
@@ -294,7 +291,7 @@ pub fn copy_locked_file(proc_name: &str, target_file: &Path, dest_path: &Path) -
                 .to_lowercase();
 
             if found_file_name != search_term {
-                let _ = CloseHandle(h_dup_win);
+                let _ = CloseHandle(h_dup as _);
                 continue;
             }
 
@@ -302,17 +299,17 @@ pub fn copy_locked_file(proc_name: &str, target_file: &Path, dest_path: &Path) -
             let mut view_size: usize = 0;
 
             if NtMapViewOfSection(
-                h_dup_win.0 as _,
-                GetCurrentProcess().0 as _,
-                &mut base,
+                h_dup as *mut _,
+                GetCurrentProcess() as *mut _,
+                &mut base as *mut _ as _,
                 0,
                 0,
                 null_mut(),
                 &mut view_size,
                 ViewShare,
                 0,
-                PAGE_READONLY.0,
-            ) == STATUS_SUCCESS.0
+                PAGE_READONLY as _,
+            ) == STATUS_SUCCESS as i32
             {
                 let success = match File::create(dest_path) {
                     Ok(mut file) => {
@@ -322,13 +319,13 @@ pub fn copy_locked_file(proc_name: &str, target_file: &Path, dest_path: &Path) -
                     Err(_) => false,
                 };
 
-                NtUnmapViewOfSection(GetCurrentProcess().0 as _, base);
-                let _ = CloseHandle(h_dup_win);
-                let _ = CloseHandle(h_proc);
+                NtUnmapViewOfSection(GetCurrentProcess() as *mut _, base as *mut _);
+                let _ = CloseHandle(h_dup as _);
+                let _ = CloseHandle(h_proc as _);
                 return success;
             }
 
-            let _ = CloseHandle(h_dup_win);
+            let _ = CloseHandle(h_dup as _);
         }
 
         let _ = CloseHandle(h_proc);

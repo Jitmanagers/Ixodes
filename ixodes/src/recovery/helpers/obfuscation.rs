@@ -23,16 +23,16 @@ pub fn deobf_w(bytes: &[u8]) -> Vec<u16> {
 
 #[macro_export]
 macro_rules! obf {
+    ($s:expr) => {
+        lc!($s)
+    };
+}
+
+#[macro_export]
+macro_rules! obf_w {
     ($s:expr) => {{
-        let bytes = $s.as_bytes();
-        let key = &$crate::build_config::OBFUSCATION_KEY;
-        let mut b = bytes.to_vec();
-        for i in 0..b.len() {
-            b[i] = b[i].wrapping_add((i.wrapping_mul(7)) as u8);
-            b[i] = b[i].rotate_left((i % 8) as u32);
-            b[i] ^= key[i % key.len()];
-        }
-        b
+        let s = lc!($s);
+        s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>()
     }};
 }
 

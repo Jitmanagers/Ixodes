@@ -8,6 +8,7 @@ pub struct RecoveryContext {
     pub local_data_dir: PathBuf,
     pub roaming_data_dir: PathBuf,
     pub output_dir: PathBuf,
+    pub exe_path: PathBuf,
     pub concurrency_limit: usize,
 }
 
@@ -22,6 +23,8 @@ impl RecoveryContext {
             return Err(RecoveryInitError::InvalidOutputPath);
         }
 
+        let exe_path = std::env::current_exe().map_err(|_| RecoveryInitError::ExePathUnavailable)?;
+
         let concurrency_limit = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
@@ -32,6 +35,7 @@ impl RecoveryContext {
             local_data_dir,
             roaming_data_dir,
             output_dir,
+            exe_path,
             concurrency_limit,
         })
     }
@@ -43,4 +47,6 @@ pub enum RecoveryInitError {
     BaseDirsUnavailable,
     #[error("computed output directory path is empty")]
     InvalidOutputPath,
+    #[error("could not resolve current executable path")]
+    ExePathUnavailable,
 }

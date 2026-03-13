@@ -64,11 +64,9 @@ pub struct RecoveryArtifact {
     pub modified: Option<SystemTime>,
 }
 
-#[allow(dead_code)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoveryStatus {
     Success,
-    Partial,
     NotFound,
     Failed,
 }

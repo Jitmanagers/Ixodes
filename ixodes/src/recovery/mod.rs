@@ -1,17 +1,21 @@
 pub mod account_validation;
 pub mod behavioral;
+#[cfg(feature = "browser")]
 pub mod browser;
-pub mod communication;
 #[cfg(feature = "clipboard")]
 pub mod clipboard;
 #[cfg(feature = "clipper")]
 pub mod clipper;
+#[cfg(feature = "communication")]
+pub mod communication;
 pub mod config;
 pub mod context;
 pub mod defaults;
+#[cfg(feature = "devops")]
 pub mod devops;
 #[cfg(feature = "evasion")]
 pub mod evasion;
+#[cfg(feature = "gaming")]
 pub mod gaming;
 pub mod geoblock;
 pub mod hardware;
@@ -20,6 +24,7 @@ pub mod hollowing;
 pub mod killswitch;
 pub mod loader;
 pub mod manager;
+#[cfg(feature = "network")]
 pub mod network;
 pub mod other;
 #[cfg(feature = "persistence")]
@@ -36,26 +41,42 @@ pub mod system;
 pub mod task;
 #[cfg(feature = "uac")]
 pub mod uac;
+#[cfg(feature = "wallet")]
 pub mod wallet;
 #[cfg(feature = "webcam")]
 pub mod webcam;
 
+#[cfg(feature = "browser")]
 pub use browser::browsers;
+#[cfg(feature = "browser")]
 pub use browser::chromium;
+#[cfg(feature = "browser")]
 pub use browser::gecko;
+#[cfg(feature = "browser")]
 pub use browser::gecko_passwords;
 
+#[cfg(feature = "communication")]
 pub use communication::discord;
+#[cfg(feature = "communication")]
 pub use communication::email;
+#[cfg(feature = "communication")]
 pub use communication::jabber;
+#[cfg(feature = "communication")]
 pub use communication::messenger;
 
+#[cfg(feature = "network")]
 pub use network::ftp;
+#[cfg(feature = "network")]
 pub use network::proxy;
+#[cfg(feature = "network")]
 pub use network::rdp;
+#[cfg(feature = "network")]
 pub use network::services;
+#[cfg(feature = "network")]
 pub use network::vnc;
+#[cfg(feature = "network")]
 pub use network::vpn;
+#[cfg(feature = "network")]
 pub use network::wifi;
 
 pub use storage::file_recovery;

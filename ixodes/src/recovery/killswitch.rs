@@ -1,7 +1,7 @@
 use crate::recovery::helpers::obfuscation::deobf;
 use std::path::Path;
-use windows::Win32::System::Threading::{MUTEX_ALL_ACCESS, OpenMutexW};
-use windows::core::PCWSTR;
+use windows_sys::Win32::System::Threading::{MUTEX_ALL_ACCESS, OpenMutexW};
+use windows_sys::Win32::Foundation::CloseHandle;
 
 pub async fn check_killswitch() -> bool {
     if check_mutexes() {
@@ -39,12 +39,10 @@ fn check_mutexes() -> bool {
     for name in mutex_names {
         let name_w: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
         unsafe {
-            let handle = OpenMutexW(MUTEX_ALL_ACCESS, false, PCWSTR(name_w.as_ptr()));
-            if let Ok(h) = handle {
-                if !h.is_invalid() {
-                    let _ = windows::Win32::Foundation::CloseHandle(h);
-                    return true;
-                }
+            let handle = OpenMutexW(MUTEX_ALL_ACCESS, 0, name_w.as_ptr());
+            if !handle.is_null() {
+                CloseHandle(handle);
+                return true;
             }
         }
     }

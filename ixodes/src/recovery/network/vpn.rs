@@ -8,15 +8,14 @@ use base64::Engine;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use std::collections::hash_map::DefaultHasher;
-use std::ffi::c_void;
 use std::ffi::{OsStr, OsString};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::{fs, io::AsyncWriteExt};
 use walkdir::WalkDir;
-use windows::Win32::Foundation::{HLOCAL, LocalFree};
-use windows::Win32::Security::Cryptography::{
+use windows_sys::Win32::Foundation::LocalFree;
+use windows_sys::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE, CryptUnprotectData,
 };
 use winreg::RegKey;
@@ -402,7 +401,6 @@ impl RecoveryTask for SurfsharkTask {
 async fn vpn_output_dir(ctx: &RecoveryContext, label: &str) -> Result<PathBuf, RecoveryError> {
     let folder = ctx
         .output_dir
-        .join("services")
         .join("VPNs")
         .join(sanitize_label(label));
     fs::create_dir_all(&folder).await?;
@@ -486,26 +484,29 @@ fn dpapi_unprotect(encrypted: &[u8]) -> Option<Vec<u8>> {
             cbData: encrypted.len() as u32,
             pbData: encrypted.as_ptr() as *mut u8,
         };
-        let mut output = CRYPT_INTEGER_BLOB::default();
+        let mut output = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
 
         let success = CryptUnprotectData(
             &mut input,
-            None,
-            None,
-            None,
-            None,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
             CRYPTPROTECT_LOCAL_MACHINE,
             &mut output,
         );
 
-        if success.is_err() {
+        if success == 0 {
             return None;
         }
 
         let slice = std::slice::from_raw_parts(output.pbData, output.cbData as usize);
         let result = slice.to_vec();
         if !output.pbData.is_null() {
-            let _ = LocalFree(HLOCAL(output.pbData as *mut c_void));
+            let _ = LocalFree(output.pbData as *mut _);
         }
         Some(result)
     }

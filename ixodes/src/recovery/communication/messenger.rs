@@ -515,7 +515,6 @@ pub(crate) async fn messenger_output_dir(
 ) -> Result<PathBuf, RecoveryError> {
     let folder = ctx
         .output_dir
-        .join("services")
         .join("Messengers")
         .join(sanitize_label(label));
     fs::create_dir_all(&folder).await?;

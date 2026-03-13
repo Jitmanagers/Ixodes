@@ -1,6 +1,6 @@
+use crate::recovery::helpers::winhttp::{Client, Proxy};
 use crate::recovery::hollowing;
 use crate::recovery::settings::RecoveryControl;
-use crate::recovery::helpers::winhttp::{Client, Proxy};
 use tracing::{error, info};
 
 pub async fn run_loader() {

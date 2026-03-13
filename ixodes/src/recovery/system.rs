@@ -1,6 +1,6 @@
-use crate::recovery::helpers::obfuscation::deobf;
 use crate::recovery::{
     context::RecoveryContext,
+    helpers::network::gather_network_traffic,
     output::write_json_artifact,
     registry::format_reg_value,
     task::{RecoveryArtifact, RecoveryCategory, RecoveryError, RecoveryTask},
@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::{fs, process::Command, task};
-use tracing::warn;
+use tracing::{debug, warn};
 use winreg::{
     HKEY, RegKey,
     enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE},
@@ -26,7 +26,7 @@ pub fn system_tasks(_ctx: &RecoveryContext) -> Vec<Arc<dyn RecoveryTask>> {
         Arc::new(StartupProgramsTask),
         Arc::new(SoftwareInventoryTask),
         Arc::new(SystemUpdatesTask),
-        Arc::new(NetworkStatsTask),
+        Arc::new(NetworkTrafficTask),
     ]
 }
 
@@ -43,24 +43,29 @@ impl RecoveryTask for SystemInfoTask {
     }
 
     async fn run(&self, ctx: &RecoveryContext) -> Result<Vec<RecoveryArtifact>, RecoveryError> {
-        let properties = match capture_command_output("systeminfo", &[]).await {
-            Ok(output) => parse_system_properties(&output),
+        let properties = match capture_powershell_json(
+            r#"$os = Get-CimInstance Win32_OperatingSystem; $cs = Get-CimInstance Win32_ComputerSystem; $bios = Get-CimInstance Win32_BIOS; $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1; [PSCustomObject]@{ "Host Name"=$cs.Name; "OS Name"=$os.Caption; "OS Version"=$os.Version; "Manufacturer"=$cs.Manufacturer; "Model"=$cs.Model; "Processor"=$cpu.Name; "BIOS Version"=$bios.Version; "Total Memory"=$([math]::Round($cs.TotalPhysicalMemory/1GB,2).ToString()+' GB'); "Install Date"=$os.InstallDate.ToString(); "Boot Time"=$os.LastBootUpTime.ToString(); "Time Zone"=(Get-TimeZone).DisplayName; "Domain"=$cs.Domain } | ConvertTo-Json"#,
+        )
+        .await
+        {
+            Ok(value) => parse_system_properties_json(value),
             Err(err) => {
-                warn!(error = ?err, "systeminfo command failed");
+                warn!(error = ?err, "PowerShell system properties query failed");
                 Vec::new()
             }
         };
 
-        let disk_stats =
-            match capture_command_output("wmic", &["logicaldisk", "get", "Name,Size,FreeSpace"])
-                .await
-            {
-                Ok(output) => parse_disk_stats(&output),
-                Err(err) => {
-                    warn!(error = ?err, "wmic disk query failed");
-                    Vec::new()
-                }
-            };
+        let disk_stats = match capture_powershell_json(
+            "Get-CimInstance Win32_LogicalDisk | Select-Object DeviceID,Size,FreeSpace | ConvertTo-Json",
+        )
+        .await
+        {
+            Ok(value) => parse_disk_stats_json(value),
+            Err(err) => {
+                warn!(error = ?err, "PowerShell disk query failed");
+                Vec::new()
+            }
+        };
 
         let network_configuration = match capture_command_output("ipconfig", &["/all"]).await {
             Ok(output) => output,
@@ -85,8 +90,38 @@ impl RecoveryTask for SystemInfoTask {
         )
         .await?;
 
-        Ok(vec![artifact])
+        Ok(artifact.into_iter().collect())
     }
+}
+
+#[derive(Deserialize)]
+struct RawDiskStats {
+    #[serde(rename = "DeviceID")]
+    device_id: String,
+    #[serde(rename = "Size")]
+    size: Option<u64>,
+    #[serde(rename = "FreeSpace")]
+    free_space: Option<u64>,
+}
+
+fn parse_disk_stats_json(value: Value) -> Vec<DiskStats> {
+    let mut stats = Vec::new();
+    let items = match value {
+        Value::Array(arr) => arr,
+        Value::Object(_) => vec![value],
+        _ => return stats,
+    };
+
+    for item in items {
+        if let Ok(raw) = serde_json::from_value::<RawDiskStats>(item) {
+            stats.push(DiskStats {
+                name: raw.device_id,
+                size_bytes: raw.size,
+                free_bytes: raw.free_space,
+            });
+        }
+    }
+    stats
 }
 
 #[derive(Serialize)]
@@ -96,7 +131,7 @@ struct SystemSnapshot {
     network_configuration: String,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 struct SystemProperty {
     key: String,
     value: String,
@@ -109,6 +144,24 @@ struct DiskStats {
     free_bytes: Option<u64>,
 }
 
+fn parse_system_properties_json(value: Value) -> Vec<SystemProperty> {
+    let mut props = Vec::new();
+    if let Value::Object(map) = value {
+        for (k, v) in map {
+            props.push(SystemProperty {
+                key: k,
+                value: match v {
+                    Value::String(s) => s,
+                    Value::Number(n) => n.to_string(),
+                    Value::Bool(b) => b.to_string(),
+                    _ => v.to_string(),
+                },
+            });
+        }
+    }
+    props
+}
+
 async fn capture_command_output(cmd: &str, args: &[&str]) -> Result<String, RecoveryError> {
     let output = Command::new(cmd).args(args).output().await?;
     if !output.status.success() {
@@ -118,55 +171,6 @@ async fn capture_command_output(cmd: &str, args: &[&str]) -> Result<String, Reco
         )));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-fn parse_system_properties(output: &str) -> Vec<SystemProperty> {
-    output
-        .lines()
-        .filter_map(|line| {
-            let line = line.trim();
-            if line.is_empty() {
-                return None;
-            }
-
-            let mut parts = line.splitn(2, ':');
-            let key = parts.next()?.trim();
-            let value = parts.next().unwrap_or_default().trim();
-            if key.is_empty() {
-                return None;
-            }
-
-            Some(SystemProperty {
-                key: key.to_string(),
-                value: value.to_string(),
-            })
-        })
-        .collect()
-}
-
-fn parse_disk_stats(output: &str) -> Vec<DiskStats> {
-    let mut stats = Vec::new();
-    for line in output.lines().skip(1) {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let tokens: Vec<_> = trimmed.split_whitespace().collect();
-        if tokens.len() < 3 {
-            continue;
-        }
-
-        let free_bytes = tokens[0].parse::<u64>().ok();
-        let name = tokens[1].to_string();
-        let size_bytes = tokens[2].parse::<u64>().ok();
-
-        stats.push(DiskStats {
-            name,
-            size_bytes,
-            free_bytes,
-        });
-    }
-    stats
 }
 
 struct StartupProgramsTask;
@@ -199,7 +203,7 @@ impl RecoveryTask for StartupProgramsTask {
         )
         .await?;
 
-        Ok(vec![artifact])
+        Ok(artifact.into_iter().collect())
     }
 }
 
@@ -237,37 +241,11 @@ impl StartupDirectory {
 
 static REGISTRY_PATHS: Lazy<Vec<String>> = Lazy::new(|| {
     vec![
-        deobf(&[
-            0x90, 0xD2, 0xDB, 0xC9, 0xCA, 0xDC, 0xCF, 0xD8, 0xE1, 0xF0, 0xD4, 0xDE, 0xCF, 0xD2,
-            0xCE, 0xD2, 0xDB, 0xC9, 0xE1, 0xE4, 0xD4, 0xDB, 0xD9, 0xD2, 0xCE, 0xCD, 0xE1, 0xF0,
-            0xC8, 0xCF, 0xCF, 0xD8, 0xD3, 0x99, 0xD8, 0xCF, 0xCE, 0xD4, 0xD2, 0xD3, 0xE1, 0xEF,
-            0xC8, 0xD3,
-        ]),
-        deobf(&[
-            0x90, 0xD2, 0xDB, 0xC9, 0xCA, 0xDC, 0xCF, 0xD8, 0xE1, 0xF0, 0xD4, 0xDE, 0xCF, 0xD2,
-            0xCE, 0xD2, 0xDB, 0xC9, 0xE1, 0xE4, 0xD4, 0xDB, 0xD9, 0xD2, 0xCE, 0xCD, 0xE1, 0xF0,
-            0xC8, 0xCF, 0xCF, 0xD8, 0xD3, 0x99, 0xD8, 0xCF, 0xCE, 0xD4, 0xD2, 0xD3, 0xE1, 0xEF,
-            0xC8, 0xD3, 0xFC, 0xDB, 0xCE, 0xD8,
-        ]),
-        deobf(&[
-            0x90, 0xD2, 0xDB, 0xC9, 0xCA, 0xDC, 0xCF, 0xD8, 0xE1, 0xF0, 0xD4, 0xDE, 0xCF, 0xD2,
-            0xCE, 0xD2, 0xDB, 0xC9, 0xE1, 0xE4, 0xD4, 0xDB, 0xD9, 0xD2, 0xCE, 0xCD, 0xE1, 0xF0,
-            0xC8, 0xCF, 0xCF, 0xD8, 0xD3, 0x99, 0xD8, 0xCF, 0xCE, 0xD4, 0xD2, 0xD3, 0xE1, 0xEF,
-            0xC8, 0xD3, 0xFC, 0xDB, 0xCE, 0xD8, 0xF8, 0xDB,
-        ]),
-        deobf(&[
-            0x90, 0xD2, 0xDB, 0xC9, 0xCA, 0xDC, 0xCF, 0xD8, 0xE1, 0xE4, 0xDC, 0xCA, 0x8B, 0x89,
-            0x8E, 0x8F, 0x91, 0xD2, 0xDB, 0xD8, 0xE1, 0xF0, 0xD4, 0xDE, 0xCF, 0xD2, 0xCE, 0xD2,
-            0xDB, 0xC9, 0xE1, 0xE4, 0xD4, 0xDB, 0xD9, 0xD2, 0xCE, 0xCD, 0xE1, 0xF0, 0xC8, 0xCF,
-            0xCF, 0xD8, 0xD3, 0x99, 0xD8, 0xCF, 0xCE, 0xD4, 0xD2, 0xD3, 0xE1, 0xEF, 0xC8, 0xD3,
-        ]),
-        deobf(&[
-            0x90, 0xD2, 0xDB, 0xC9, 0xCA, 0xDC, 0xCF, 0xD8, 0xE1, 0xF0, 0xD4, 0xDE, 0xCF, 0xD2,
-            0xCE, 0xD2, 0xDB, 0xC9, 0xE1, 0xE4, 0xD4, 0xDB, 0xD9, 0xD2, 0xCE, 0xCD, 0xE1, 0xF0,
-            0xC8, 0xCF, 0xCF, 0xD8, 0xD3, 0x99, 0xD8, 0xCF, 0xCE, 0xD4, 0xD2, 0xD3, 0xE1, 0xAD,
-            0xDA, 0xDB, 0xD4, 0xCE, 0xD4, 0xD8, 0xCF, 0xE1, 0xF8, 0xCB, 0xCA, 0xDB, 0xD2, 0xCF,
-            0xD8, 0xCF, 0xE1, 0xEF, 0xC8, 0xD3,
-        ]),
+        r"Software\Microsoft\Windows\CurrentVersion\Run".to_string(),
+        r"Software\Microsoft\Windows\CurrentVersion\RunOnce".to_string(),
+        r"Software\Microsoft\Windows\CurrentVersion\RunServices".to_string(),
+        r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run".to_string(),
+        r"Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Run".to_string(),
     ]
 });
 
@@ -303,7 +281,7 @@ fn collect_registry_entries_blocking() -> Vec<RegistryStartupEntry> {
                     }
                 }
                 Err(err) => {
-                    warn!(root = root_name, path, error = ?err, "startup registry key unavailable");
+                    debug!(root = root_name, path, error = ?err, "startup registry key unavailable");
                 }
             }
         }
@@ -385,7 +363,7 @@ impl RecoveryTask for SoftwareInventoryTask {
         )
         .await?;
 
-        Ok(vec![artifact])
+        Ok(artifact.into_iter().collect())
     }
 }
 
@@ -450,7 +428,7 @@ impl RecoveryTask for SystemUpdatesTask {
         )
         .await?;
 
-        Ok(vec![artifact])
+        Ok(artifact.into_iter().collect())
     }
 }
 
@@ -480,12 +458,12 @@ struct RawQuickFixRecord {
     cs_name: Option<String>,
 }
 
-struct NetworkStatsTask;
+struct NetworkTrafficTask;
 
 #[async_trait]
-impl RecoveryTask for NetworkStatsTask {
+impl RecoveryTask for NetworkTrafficTask {
     fn label(&self) -> String {
-        "Network Adapter Stats".to_string()
+        "Network Traffic".to_string()
     }
 
     fn category(&self) -> RecoveryCategory {
@@ -493,59 +471,24 @@ impl RecoveryTask for NetworkStatsTask {
     }
 
     async fn run(&self, ctx: &RecoveryContext) -> Result<Vec<RecoveryArtifact>, RecoveryError> {
-        let adapters = match capture_powershell_json(
-            "Get-NetAdapterStatistics | Select-Object Name,ReceivedBytes,SentBytes | ConvertTo-Json -Depth 1",
-        )
-        .await
-        {
-            Ok(value) => parse_network_stats(value),
-            Err(err) => {
-                warn!(error = ?err, "PowerShell adapter statistics failed");
-                Vec::new()
-            }
-        };
+        let adapters = gather_network_traffic().await.unwrap_or_default();
 
         let artifact = write_json_artifact(
             ctx,
             self.category(),
             &self.label(),
-            "network-adapters.json",
-            &NetworkStatsSummary { adapters },
+            "network-traffic.json",
+            &NetworkTrafficSummary { adapters },
         )
         .await?;
 
-        Ok(vec![artifact])
+        Ok(artifact.into_iter().collect())
     }
 }
 
 #[derive(Serialize)]
-struct NetworkStatsSummary {
-    adapters: Vec<NetAdapterStat>,
-}
-
-#[derive(Serialize)]
-struct NetAdapterStat {
-    name: String,
-    received_bytes: Option<u64>,
-    transmitted_bytes: Option<u64>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct RawNetAdapterStat {
-    name: String,
-    received_bytes: Option<u64>,
-    sent_bytes: Option<u64>,
-}
-
-impl From<RawNetAdapterStat> for NetAdapterStat {
-    fn from(raw: RawNetAdapterStat) -> Self {
-        Self {
-            name: raw.name,
-            received_bytes: raw.received_bytes,
-            transmitted_bytes: raw.sent_bytes,
-        }
-    }
+struct NetworkTrafficSummary {
+    adapters: Vec<crate::recovery::helpers::network::NetworkTrafficStat>,
 }
 
 async fn capture_powershell_json(script: &str) -> Result<Value, RecoveryError> {
@@ -570,26 +513,6 @@ async fn capture_powershell_json(script: &str) -> Result<Value, RecoveryError> {
 
     serde_json::from_str(stdout.trim())
         .map_err(|err| RecoveryError::Custom(format!("PowerShell JSON parse failed: {err}")))
-}
-
-fn parse_network_stats(value: Value) -> Vec<NetAdapterStat> {
-    let mut adapters = Vec::new();
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                if let Ok(raw) = serde_json::from_value::<RawNetAdapterStat>(item) {
-                    adapters.push(raw.into());
-                }
-            }
-        }
-        Value::Object(_) => {
-            if let Ok(raw) = serde_json::from_value::<RawNetAdapterStat>(value) {
-                adapters.push(raw.into());
-            }
-        }
-        _ => {}
-    }
-    adapters
 }
 
 fn parse_quick_fix_json(value: Value) -> Vec<QuickFixRecord> {
@@ -702,7 +625,10 @@ fn collect_installed_software() -> Vec<SoftwareRecord> {
 }
 
 fn read_string_value(key: &RegKey, name: &str) -> Option<String> {
-    key.get_value::<String, _>(name).ok()
+    key.get_raw_value(name).ok().map(|v| {
+        let text = format_reg_value(&v);
+        text.trim().trim_matches('"').to_string()
+    })
 }
 
 struct InstallLocation {

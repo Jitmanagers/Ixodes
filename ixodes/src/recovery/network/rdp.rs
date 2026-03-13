@@ -8,7 +8,6 @@ use async_trait::async_trait;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::fs;
 use walkdir::WalkDir;
 use winreg::RegKey;
 use winreg::enums::HKEY_CURRENT_USER;
@@ -60,7 +59,7 @@ impl RecoveryTask for RdpTask {
         let registry_connections = collect_registry_rdp();
 
         let mut discovered_files = Vec::new();
-        let dest_root = rdp_output_dir(ctx).await?;
+        let dest_root = ctx.output_dir.join("System").join("RDP");
 
         for dir in &self.search_dirs {
             if !dir.exists() {
@@ -81,17 +80,7 @@ impl RecoveryTask for RdpTask {
                     let file_path = entry.path();
                     discovered_files.push(file_path.display().to_string());
 
-                    let file_name = file_path.file_name().unwrap_or_default();
-                    let dest_path = dest_root.join(file_name);
-                    if let Ok(_) = fs::copy(file_path, &dest_path).await {
-                        let meta = fs::metadata(&dest_path).await.ok();
-                        artifacts.push(RecoveryArtifact {
-                            label: "RDP Config".to_string(),
-                            path: dest_path,
-                            size_bytes: meta.as_ref().map(|m| m.len()).unwrap_or(0),
-                            modified: meta.and_then(|m| m.modified().ok()),
-                        });
-                    }
+                    let _ = crate::recovery::fs::copy_file_with_structure("RDP Config", file_path, dir, &dest_root, &mut artifacts).await;
                 }
             }
         }
@@ -109,7 +98,7 @@ impl RecoveryTask for RdpTask {
             &summary,
         )
         .await?;
-        artifacts.push(artifact);
+        artifacts.extend(artifact);
 
         Ok(artifacts)
     }
@@ -139,10 +128,4 @@ fn collect_registry_rdp() -> Vec<RdpRegistryConnection> {
     }
 
     connections
-}
-
-async fn rdp_output_dir(ctx: &RecoveryContext) -> Result<PathBuf, RecoveryError> {
-    let folder = ctx.output_dir.join("services").join("System").join("RDP");
-    fs::create_dir_all(&folder).await?;
-    Ok(folder)
 }

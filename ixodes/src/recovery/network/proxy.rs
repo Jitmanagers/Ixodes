@@ -113,14 +113,12 @@ async fn handle_socks5_server(mut stream: TcpStream) -> std::io::Result<()> {
     let atyp = head[3];
     let addr_str = match atyp {
         0x01 => {
-            // IPv4
             let mut addr_bytes = [0u8; 4];
             stream.read_exact(&mut addr_bytes).await?;
             let ip = IpAddr::V4(std::net::Ipv4Addr::from(addr_bytes));
             ip.to_string()
         }
         0x03 => {
-            // Domain
             let mut len_byte = [0u8; 1];
             stream.read_exact(&mut len_byte).await?;
             let len = len_byte[0] as usize;
@@ -129,7 +127,6 @@ async fn handle_socks5_server(mut stream: TcpStream) -> std::io::Result<()> {
             String::from_utf8_lossy(&domain_bytes).to_string()
         }
         0x04 => {
-            // IPv6
             let mut addr_bytes = [0u8; 16];
             stream.read_exact(&mut addr_bytes).await?;
             let ip = IpAddr::V6(std::net::Ipv6Addr::from(addr_bytes));

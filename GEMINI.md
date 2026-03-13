@@ -12,7 +12,7 @@ A Rust application acting as the core data extraction engine.
     *   `src/main.rs`: Entry point; initializes logging, context, and the recovery manager.
     *   `src/recovery/manager.rs`: Orchestrates various recovery tasks.
     *   `src/recovery/`: Contains modules for specific data targets (e.g., `browser`, `wallet`, `gaming`, `communication`).
-    *   `Cargo.toml`: Manages dependencies (`tokio`, `rusqlite`, `reqwest`, `nokhwa`, etc.) and build profiles.
+    *   `Cargo.toml`: Manages dependencies (`tokio`, `reqwest`, `nokhwa`, etc.) and build profiles. Uses system `winsqlite3.dll` for minimal binary size.
 
 ### `ixodes-gui/` (The Builder)
 A SvelteKit + Tauri v2 application for configuring and building the agent.

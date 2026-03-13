@@ -1,4 +1,5 @@
 pub mod anti_vm;
+pub mod dynamic_api;
 pub mod hardware;
 #[cfg(feature = "evasion")]
 pub mod hw_breakpoints;
@@ -7,6 +8,9 @@ pub mod obfuscation;
 pub mod payload;
 pub mod pe;
 pub mod sleep;
+pub mod sqlite;
 pub mod syscalls;
 pub mod unhooking;
 pub mod winhttp;
+pub mod com;
+pub mod com_defs;

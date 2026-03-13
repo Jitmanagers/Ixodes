@@ -1,8 +1,8 @@
-use crate::recovery::task::RecoveryError;
 use crate::recovery::helpers::winhttp::Client;
+use crate::recovery::task::RecoveryError;
 use serde_json::Value;
 use tokio::process::Command;
-use tracing::warn;
+use tracing::{debug, warn};
 use winreg::{RegKey, enums::HKEY_LOCAL_MACHINE};
 
 pub struct HardwareSnapshot {
@@ -27,47 +27,44 @@ pub struct DriveDetails {
 
 pub async fn gather_snapshot(client: &Client) -> HardwareSnapshot {
     HardwareSnapshot {
-        operating_system: describe_command_output("Operating System", "systeminfo", &[]).await,
+        operating_system: describe_command_output("Operating System", "powershell", &["-NoProfile", "-Command", "(Get-CimInstance Win32_OperatingSystem).Caption"]).await,
         location: fetch_location(client).await,
         product_key: read_windows_product_key(),
-        bios_version: describe_command_output("BIOS Version", "wmic", &["bios", "get", "version"])
+        bios_version: describe_command_output("BIOS Version", "powershell", &["-NoProfile", "-Command", "(Get-CimInstance Win32_BIOS).Version"])
             .await,
         processor_id: describe_command_output(
             "Processor ID",
-            "wmic",
-            &["cpu", "get", "ProcessorId"],
+            "powershell",
+            &["-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).ProcessorId"],
         )
         .await,
         motherboard_serial: describe_command_output(
             "Motherboard Serial",
-            "wmic",
-            &["baseboard", "get", "SerialNumber"],
+            "powershell",
+            &["-NoProfile", "-Command", "(Get-CimInstance Win32_BaseBoard).SerialNumber"],
         )
         .await,
         total_physical_memory: describe_command_output(
             "Total Memory",
-            "wmic",
-            &["computersystem", "get", "TotalPhysicalMemory"],
+            "powershell",
+            &["-NoProfile", "-Command", "[math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 2).ToString() + ' GB'"],
         )
         .await,
         graphics_card: describe_command_output(
             "Graphics Card",
-            "wmic",
-            &["path", "win32_videocontroller", "get", "name"],
+            "powershell",
+            &["-NoProfile", "-Command", "(Get-CimInstance Win32_VideoController).Name"],
         )
         .await,
         wifi_profiles: gather_wifi_profiles().await,
         system_uptime: fetch_system_uptime().await,
         network_adapters: describe_command_output(
             "Network Adapters",
-            "wmic",
+            "powershell",
             &[
-                "path",
-                "Win32_NetworkAdapter",
-                "where",
-                "NetEnabled=True",
-                "get",
-                "Name,Speed",
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_NetworkAdapter | Where-Object { $_.NetEnabled -eq $true } | Select-Object -Property Name, @{Name='Speed';Expression={($_.Speed/1MB).ToString() + ' Mbps'}} | Out-String",
             ],
         )
         .await,
@@ -77,20 +74,20 @@ pub async fn gather_snapshot(client: &Client) -> HardwareSnapshot {
 pub async fn gather_drive_info() -> DriveDetails {
     let disk_drives = describe_command_output(
         "Disk Drives",
-        "wmic",
-        &["diskdrive", "get", "DeviceID,Model,Size,SerialNumber"],
+        "powershell",
+        &["-NoProfile", "-Command", "Get-CimInstance Win32_DiskDrive | Select-Object DeviceID, Model, @{Name='Size';Expression={($_.Size/1GB).ToString('F2') + ' GB'}}, SerialNumber | Out-String"],
     )
     .await;
     let partitions = describe_command_output(
         "Partitions",
-        "wmic",
-        &["partition", "get", "DiskIndex,DeviceID,Name"],
+        "powershell",
+        &["-NoProfile", "-Command", "Get-CimInstance Win32_DiskPartition | Select-Object DiskIndex, DeviceID, Name | Out-String"],
     )
     .await;
     let logical_disks = describe_command_output(
         "Logical Disks",
-        "wmic",
-        &["logicaldisk", "get", "DeviceID,FileSystem,FreeSpace,Size"],
+        "powershell",
+        &["-NoProfile", "-Command", "Get-CimInstance Win32_LogicalDisk | Select-Object DeviceID, FileSystem, @{Name='FreeSpace';Expression={($_.FreeSpace/1GB).ToString('F2') + ' GB'}}, @{Name='Size';Expression={($_.Size/1GB).ToString('F2') + ' GB'}} | Out-String"],
     )
     .await;
 
@@ -207,8 +204,8 @@ async fn gather_wifi_profiles() -> String {
             }
         }
         Err(err) => {
-            warn!(error = ?err, "failed to retrieve wifi profiles");
-            "WIFI profiles unavailable".to_string()
+            debug!(error = ?err, "failed to retrieve wifi profiles (expected on machines without wifi)");
+            "WIFI profiles unavailable (hardware not present or service stopped)".to_string()
         }
     }
 }

